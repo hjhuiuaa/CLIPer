@@ -1,0 +1,4 @@
+
+# local legacy splits (keep local, do not track)
+dataset/disprot9.5/train.fasta
+dataset/disprot9.5/valid.fasta
