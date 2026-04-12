@@ -5,3 +5,12 @@ dataset/disprot9.5/valid.fasta
 
 dataset/train.fasta
 dataset/valid.fasta
+
+# training artifacts
+artifacts/
+*.pt
+
+# python cache
+__pycache__/
+*.pyc
+.pytest_cache/

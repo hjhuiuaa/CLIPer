@@ -1,0 +1,28 @@
+{
+  "generated_at_utc": "2026-04-12T07:18:08+00:00",
+  "source_fasta": "dataset\\disprot_202312_linker_label.fasta",
+  "error_id_count_in_file": 18,
+  "error_ids_present_in_source": [
+    "DP00018",
+    "DP00040",
+    "DP00075",
+    "DP00194",
+    "DP00435",
+    "DP00949",
+    "DP01326",
+    "DP01450",
+    "DP01817",
+    "DP02262",
+    "DP02398",
+    "DP02477",
+    "DP02878",
+    "DP02925",
+    "DP02999",
+    "DP03034",
+    "DP03241",
+    "DP03529"
+  ],
+  "error_ids_missing_from_source": [],
+  "holdout_overlap_ids": [],
+  "excluded_total": 18
+}
