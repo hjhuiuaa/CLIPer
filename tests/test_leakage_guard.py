@@ -43,9 +43,9 @@ def test_train_raises_on_caid_leakage(tmp_path: Path) -> None:
         "split_manifest": str(split_manifest),
         "output_dir": str(tmp_path / "out"),
         "device": "cpu",
+        "auto_start_tensorboard": False,
     }
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     with pytest.raises(ValueError, match="leakage"):
         train(config_path)
-

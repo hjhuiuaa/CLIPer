@@ -65,6 +65,10 @@ def test_prepare_train_eval_smoke(tmp_path: Path) -> None:
         "device": "cpu",
         "eval_stride": 32,
         "top_k_heuristic": 2,
+        "save_every": 1,
+        "print_every": 1,
+        "eval_every": 2,
+        "auto_start_tensorboard": False,
     }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -73,18 +77,25 @@ def test_prepare_train_eval_smoke(tmp_path: Path) -> None:
     checkpoint_path = Path(train_result["best_checkpoint"])
     assert checkpoint_path.exists()
     assert Path(train_result["output_dir"]).exists()
+    assert train_result["run_id"].startswith("exp")
+    assert Path(train_result["log_file"]).exists()
+    assert Path(train_result["tensorboard_dir"]).exists()
+    assert Path(train_result["last_checkpoint"]).exists()
+    step_ckpts = list((Path(train_result["output_dir"]) / "checkpoints").glob("step_*.pt"))
+    assert step_ckpts
 
-    eval_out = tmp_path / "eval"
     eval_result = evaluate(
         checkpoint_path=checkpoint_path,
         fasta_path=caid_fasta,
-        output_dir=eval_out,
     )
     predictions_path = Path(eval_result["predictions_path"])
     metrics_path = Path(eval_result["metrics_path"])
     assert predictions_path.exists()
     assert metrics_path.exists()
+    assert eval_result["eval_id"].startswith("eval")
+    assert Path(eval_result["output_dir"]).is_dir()
+    assert Path(eval_result["output_dir"]).parent == Path(train_result["output_dir"]) / "evaluations"
+    assert eval_result["tensorboard_service"]["status"] == "disabled"
 
     header = predictions_path.read_text(encoding="utf-8").splitlines()[0]
     assert header == "protein_id\tposition_1based\tprobability\tpred_label"
-

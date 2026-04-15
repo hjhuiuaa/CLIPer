@@ -24,4 +24,11 @@ train_fasta: dataset/disprot_202312_linker_label.fasta
 caid_fasta: dataset/linker.fasta
 split_manifest: artifacts/splits/disprot_split_seed42.json
 output_dir: artifacts/runs/stage1_prostt5
+experiment_prefix: exp
+save_every: 500
+print_every: 20
+eval_every: 200
+auto_start_tensorboard: true
+tensorboard_host: 0.0.0.0
+tensorboard_port: 6006
 

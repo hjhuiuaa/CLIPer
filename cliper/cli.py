@@ -33,7 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser = subparsers.add_parser("eval", help="Run evaluation using a saved checkpoint.")
     eval_parser.add_argument("--checkpoint", required=True, help="Path to checkpoint .pt file.")
     eval_parser.add_argument("--fasta", required=True, help="Path to evaluation FASTA.")
-    eval_parser.add_argument("--output-dir", required=True, help="Directory for metrics and predictions.")
+    eval_parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Optional output directory. If omitted, auto-save to checkpoint experiment folder.",
+    )
     eval_parser.add_argument("--split-manifest", default=None, help="Optional split manifest JSON.")
     eval_parser.add_argument("--split-key", default=None, help="Optional split key (e.g., train_ids or val_ids).")
     eval_parser.add_argument("--threshold", type=float, default=None, help="Optional decision threshold override.")
@@ -78,4 +82,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

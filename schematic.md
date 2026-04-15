@@ -12,3 +12,8 @@
   - 排除 `dataset/error.txt` 中的不一致样本
   - 长序列训练使用 linker 中心裁剪，评估使用无标签启发式窗口 + 覆盖窗口
   - 以验证集 AUPRC 选择最优 checkpoint
+  - TensorBoard 记录训练/验证曲线，训练日志写入 `logs/train.log`
+  - 每次实验自动编号并独立保存 checkpoint（`expXXXX/checkpoints`）
+  - `save_every` / `print_every` / `eval_every` 控制保存、日志打印与验证频率
+  - 训练与评测阶段自动尝试启动 TensorBoard
+  - 评测输出默认写入 checkpoint 对应实验目录：`expXXXX/evaluations/evalXXXX`
