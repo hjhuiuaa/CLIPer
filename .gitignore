@@ -14,3 +14,7 @@ artifacts/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# local large/generated files
+models/
+artifacts/
