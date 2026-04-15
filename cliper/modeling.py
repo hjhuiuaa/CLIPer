@@ -106,14 +106,18 @@ def load_backbone_and_tokenizer(backbone_name: str) -> tuple[nn.Module, Any, int
         return backbone, tokenizer, hidden_size
 
     try:
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoConfig, AutoModel, AutoTokenizer, T5EncoderModel
     except ImportError as exc:
         raise ImportError(
             "transformers is required for non-dummy backbones. Install dependencies before training/evaluation."
         ) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(backbone_name, do_lower_case=False)
-    backbone = AutoModel.from_pretrained(backbone_name)
+    config = AutoConfig.from_pretrained(backbone_name)
+    if getattr(config, "model_type", None) == "t5":
+        backbone = T5EncoderModel.from_pretrained(backbone_name)
+    else:
+        backbone = AutoModel.from_pretrained(backbone_name)
     hidden_size = _resolve_hidden_size(backbone)
     return backbone, tokenizer, hidden_size
 

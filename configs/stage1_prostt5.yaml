@@ -1,4 +1,4 @@
-backbone_name: Rostlab/ProstT5
+backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
 window_size: 1024
 batch_tokens: 2048
 optimizer: adamw
