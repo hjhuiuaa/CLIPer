@@ -397,6 +397,19 @@ def _start_wandb_if_needed(
     config_payload: dict[str, Any],
     logger,
 ) -> tuple[Any | None, dict[str, Any]]:
+    # W&B integration is temporarily disabled by request.
+    logger("[wandb] temporarily commented out (disabled).")
+    return None, {
+        "status": "disabled",
+        "project": project,
+        "entity": entity,
+        "run_id": None,
+        "run_name": None,
+        "mode": mode,
+        "url": None,
+        "dir": None,
+    }
+
     if not enabled:
         logger("[wandb] disabled by config.")
         return None, {
