@@ -410,62 +410,6 @@ def _start_wandb_if_needed(
         "dir": None,
     }
 
-    if not enabled:
-        logger("[wandb] disabled by config.")
-        return None, {
-            "status": "disabled",
-            "project": project,
-            "entity": entity,
-            "run_id": None,
-            "run_name": None,
-            "mode": mode,
-            "url": None,
-            "dir": None,
-        }
-
-    resolved_project = str(project or "").strip()
-    if not resolved_project:
-        raise ValueError("W&B is enabled but wandb_project is empty.")
-    resolved_entity = str(entity).strip() if entity else None
-    resolved_name = str(run_name).strip() if run_name else None
-    resolved_group = str(group).strip() if group else None
-    resolved_dir = Path(run_dir) if run_dir else Path.cwd() / "wandb"
-    resolved_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        import wandb
-    except ImportError as exc:
-        raise ImportError(
-            "W&B is enabled but dependency `wandb` is missing. "
-            "Install with: pip install wandb"
-        ) from exc
-
-    run = wandb.init(
-        project=resolved_project,
-        entity=resolved_entity,
-        name=resolved_name,
-        group=resolved_group,
-        tags=tags or None,
-        mode=mode,
-        dir=str(resolved_dir),
-        config=config_payload,
-        job_type=job_type,
-    )
-    run_id = getattr(run, "id", None)
-    actual_name = getattr(run, "name", None)
-    url = getattr(run, "url", None)
-    logger(f"[wandb] started run_id={run_id} run_name={actual_name} mode={mode}")
-    return run, {
-        "status": "started",
-        "project": resolved_project,
-        "entity": resolved_entity,
-        "run_id": run_id,
-        "run_name": actual_name,
-        "mode": mode,
-        "url": url,
-        "dir": str(resolved_dir),
-    }
-
 
 def _wandb_log(run: Any | None, payload: dict[str, Any], *, step: int | None = None) -> None:
     if run is None:

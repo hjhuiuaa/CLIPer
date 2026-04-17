@@ -23,10 +23,18 @@
   - `total_loss = bce_loss + contrastive.weight * supcon_loss`
 * 训练策略：从零开始联合训练（不依赖 Stage 1 checkpoint）
 * 主干策略：默认继续冻结 **ProstT5**，训练分类头与投影头（projection head）
-* 对比学习样本构造：
-  - 以残基标签 `0/1` 在 batch 内构造监督对比学习正负对
-  - 无效标签位（`-`）不参与对比损失
-  - 若 batch 内单类或有效样本不足，则该 step 的 `supcon_loss=0`，仅优化 BCE
+* 当前 SupCon 实现（与 `cliper/pipeline.py` 一致）：
+  - 输入特征：模型前向时返回 `residue_embeddings`（由 projection head 输出）
+  - 有效位筛选：仅保留 `labels >= 0` 的残基；`-`（掩码位）直接丢弃
+  - 类内采样：对标签 `0/1` 分别采样，每类最多 `contrastive.max_samples_per_class`
+  - 退化保护：若采样后总样本 `< 2` 或类别数 `< 2`，返回 `supcon_loss=0`
+  - 相似度计算：对 embedding 做 L2 normalize，使用
+    `logits = (z @ z^T) / temperature`
+  - 自对比排除：用对角 mask 去掉样本与自身配对
+  - 正样本定义：同标签样本互为正对（监督对比）
+  - 数值稳定：每行减去该行最大值后再做 `exp/log`
+  - 损失形式：对每个 anchor 取正样本对数概率均值，再取负号与 batch 均值
+  - 非有限值保护：若损失出现 NaN/Inf，直接抛错中止
 * 配置入口：
   - Stage 1 模板：`configs/stage1_prostt5.yaml`
   - Stage 2 模板：`configs/stage2_prostt5_supcon.yaml`
