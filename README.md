@@ -46,12 +46,16 @@ python -m cliper.cli prepare_data \
 python -m cliper.cli train --config configs/stage1_prostt5.yaml
 ```
 
-训练后可用 TensorBoard 查看：
+训练时若 `auto_start_tensorboard: true`（默认），会在服务器上启动 TensorBoard（`tensorboard_host` / `tensorboard_port`，见 `configs/stage1_prostt5.yaml`）。日志目录在当次实验子目录下：`artifacts/runs/<output_dir>/expXXXX/tensorboard/`。
+
+在**服务器上**手动查看（汇总该 `output_dir` 下所有 `expXXXX`）：
 ```bash
-tensorboard --logdir artifacts/runs/stage1_prostt5
+tensorboard --logdir artifacts/runs/stage1_prostt5 --host 0.0.0.0 --port 6006
 ```
 
-远程训练时可用 PowerShell 转发端口到本地：
+在**本机浏览器**看远程 TensorBoard：把服务器端口转发到本地。
+
+**Windows（PowerShell）**，与仓库脚本一致：
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/forward_tensorboard.ps1 `
   -RemoteHost <server_ip_or_domain> `
@@ -59,7 +63,21 @@ powershell -ExecutionPolicy Bypass -File scripts/forward_tensorboard.ps1 `
   -RemotePort 6006 `
   -LocalPort 16006
 ```
-然后在本地浏览器访问 `http://127.0.0.1:16006`。
+
+**Linux / macOS / Git Bash**：
+```bash
+chmod +x scripts/forward_tensorboard.sh
+bash scripts/forward_tensorboard.sh <username>@<server_host> 6006 16006
+```
+
+可选指定 SSH 私钥：
+```bash
+bash scripts/forward_tensorboard.sh <username>@<server_host> 6006 16006 ~/.ssh/id_ed25519
+```
+
+然后在本地浏览器打开 `http://127.0.0.1:16006`。
+
+**说明**：训练进程自动起的 TensorBoard 若启动失败，请确认已安装依赖 `pip install -r requirements.txt`（含 `tensorboard`），并查看当次实验目录下 `logs/tensorboard_runtime.log`。多用户共用机器时若 `6006` 冲突，请在 YAML 里改 `tensorboard_port`。
 
 ### 3) Evaluate a checkpoint
 ```bash
@@ -89,4 +107,4 @@ python -m cliper.cli eval \
 - For local tests without downloading a backbone, use `backbone_name: dummy` in config.
 - `save_every` / `print_every` / `eval_every` 默认单位是训练 step（global step）。
 - TensorBoard 自动启动相关参数：`auto_start_tensorboard` / `tensorboard_host` / `tensorboard_port`。
-- 远程端口转发脚本：[`scripts/forward_tensorboard.ps1`](scripts/forward_tensorboard.ps1)。
+- 远程端口转发：`scripts/forward_tensorboard.ps1`（Windows）、`scripts/forward_tensorboard.sh`（Linux/macOS/Git Bash）。

@@ -18,3 +18,7 @@ __pycache__/
 # local large/generated files
 models/
 artifacts/
+
+# local export / sync bundles (large; do not commit)
+*.tar
+*.tar.gz
