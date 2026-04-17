@@ -5,7 +5,7 @@
 * 分类标签：`0` 非 linker，`1` linker
 * 特征主干：预训练 **ProstT5**（Stage 1 冻结主干，仅训练分类头）
 * 数据集说明见 `dataset/README.md`
-  - 训练/验证：`dataset/disprot_202312_linker_label.fasta`
+  - 训练/验证：`dataset/disprot_202312_linker_label.fasta`（当前已清洗为仅保留含 linker 的蛋白）
   - 最终测试（严格 holdout）：`dataset/linker.fasta`（CAID3）
 * 关键流程：
   - 固定随机种子进行蛋白级 8:2 划分
@@ -41,9 +41,17 @@
   - 关键字段：`stage`、`contrastive.*`、`use_wandb`、`wandb_*`
 * 可视化与日志：
   - TensorBoard 指标：`train/loss_bce`、`train/loss_supcon`、`train/loss_total`、`train/contrastive_num_samples`
-  - W&B（可选）：训练/验证/CAID3 与评测指标自动上报
-  - 每次实验实际生效参数（resolved YAML）写入 `wandb.config`
+  - W&B：当前代码中已注释停用（返回 `disabled`，不实际上报）
 * 产物与元数据：
   - 训练目录：`artifacts/runs/.../expXXXX/`
   - 评测目录：`artifacts/runs/.../expXXXX/evaluations/evalXXXX/`
   - `run_metadata.json` / `evaluation_metadata.json` 中包含 `wandb_service` 与运行信息
+
+## 数据清洗策略（当前口径）
+* 原始文件备份：`dataset/disprot_202312_linker_label_not_cleaned.fasta`
+* 清洗后训练文件：`dataset/disprot_202312_linker_label.fasta`
+* 清洗规则：移除标签全 `0` 的蛋白，仅保留标签中至少含一个 `1` 的样本
+* 清洗统计报告：`artifacts/splits/disprot_linker_clean_report.json`
+* split 需基于清洗后 FASTA 重新生成：
+  - `artifacts/splits/disprot_split_seed42.json`
+  - `artifacts/splits/exclusion_report_seed42.json`

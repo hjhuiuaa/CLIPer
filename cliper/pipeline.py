@@ -61,6 +61,8 @@ DEFAULTS = {
     "dropout": 0.1,
     "freeze_backbone": True,
     "val_ratio": 0.2,
+    "error_file": "dataset/error.txt",
+    "auto_rebuild_split_on_mismatch": True,
     "eval_stride": None,
     "top_k_heuristic": 4,
     "num_workers": 0,
@@ -194,6 +196,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
     if merged["optimizer"].lower() != "adamw":
         raise ValueError("Only optimizer=adamw is supported.")
+    merged["auto_rebuild_split_on_mismatch"] = bool(merged.get("auto_rebuild_split_on_mismatch", True))
     wandb_mode = str(merged.get("wandb_mode", "online")).lower()
     if wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError(
@@ -482,6 +485,108 @@ def prepare_data(
         "exclusion_report_path": str(Path(exclusion_out)),
         "counts": split_manifest["counts"],
     }
+
+
+def _safe_parse_id_lines(path: str | Path, *, kind: str, logger) -> set[str]:
+    source = Path(path)
+    if not source.exists():
+        logger(f"[split] {kind} file not found: {source}. Treat as empty id set during split rebuild.")
+        return set()
+    return parse_id_lines(source)
+
+
+def _resolve_train_val_records(
+    *,
+    all_records: list[ProteinRecord],
+    caid_records: list[ProteinRecord],
+    split_manifest_path: str | Path,
+    source_fasta_path: str | Path,
+    error_file_path: str | Path,
+    seed: int,
+    val_ratio: float,
+    auto_rebuild_on_mismatch: bool,
+    logger,
+) -> tuple[list[ProteinRecord], list[ProteinRecord], dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    split_manifest_source = Path(split_manifest_path)
+    available_ids = {rec.protein_id for rec in all_records}
+    caid_ids = {rec.protein_id for rec in caid_records}
+
+    split_manifest: dict[str, Any] | None = None
+    missing_train: list[str] = []
+    missing_val: list[str] = []
+
+    if split_manifest_source.exists():
+        split_manifest = read_json(split_manifest_source)
+        train_ids = split_manifest.get("train_ids")
+        val_ids = split_manifest.get("val_ids")
+        if not isinstance(train_ids, list) or not isinstance(val_ids, list):
+            raise ValueError(
+                f"Invalid split manifest format at {split_manifest_source}. "
+                "Expected list fields: train_ids and val_ids."
+            )
+        missing_train = sorted(set(train_ids) - available_ids)
+        missing_val = sorted(set(val_ids) - available_ids)
+    elif not auto_rebuild_on_mismatch:
+        raise FileNotFoundError(
+            f"split_manifest file not found: {split_manifest_source}. "
+            "Set auto_rebuild_split_on_mismatch=true to rebuild automatically."
+        )
+
+    needs_rebuild = (split_manifest is None) or bool(missing_train or missing_val)
+    if not needs_rebuild:
+        train_records = select_records(all_records, split_manifest["train_ids"])
+        val_records = select_records(all_records, split_manifest["val_ids"])
+        return (
+            train_records,
+            val_records,
+            split_manifest,
+            {
+                "status": "used",
+                "source_split_manifest_path": str(split_manifest_source),
+                "missing_train_ids_count": 0,
+                "missing_val_ids_count": 0,
+                "missing_train_ids_sample": [],
+                "missing_val_ids_sample": [],
+            },
+            None,
+        )
+
+    if not auto_rebuild_on_mismatch:
+        raise ValueError(
+            "Split manifest is inconsistent with current training FASTA. "
+            f"Missing train ids={len(missing_train)}, missing val ids={len(missing_val)}. "
+            "Set auto_rebuild_split_on_mismatch=true to rebuild automatically."
+        )
+
+    logger(
+        "[split] detected split/FASTA mismatch, rebuilding split manifest "
+        f"(missing_train={len(missing_train)} missing_val={len(missing_val)})."
+    )
+    error_ids = _safe_parse_id_lines(error_file_path, kind="error", logger=logger)
+    rebuilt_manifest, rebuilt_exclusion = build_split_manifest(
+        all_records,
+        source_fasta=source_fasta_path,
+        error_ids=error_ids,
+        caid_ids=caid_ids,
+        seed=seed,
+        val_ratio=val_ratio,
+    )
+    train_records = select_records(all_records, rebuilt_manifest["train_ids"])
+    val_records = select_records(all_records, rebuilt_manifest["val_ids"])
+    return (
+        train_records,
+        val_records,
+        rebuilt_manifest,
+        {
+            "status": "rebuilt",
+            "source_split_manifest_path": str(split_manifest_source),
+            "missing_train_ids_count": len(missing_train),
+            "missing_val_ids_count": len(missing_val),
+            "missing_train_ids_sample": missing_train[:10],
+            "missing_val_ids_sample": missing_val[:10],
+        },
+        rebuilt_exclusion,
+    )
 
 
 def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> torch.Tensor:
@@ -815,11 +920,33 @@ def train(config_path: str | Path) -> dict[str, Any]:
     )
     writer.add_text("wandb/service", json.dumps(wandb_info, ensure_ascii=False, indent=2), 0)
 
-    split_manifest = read_json(config["split_manifest"])
     all_records = parse_three_line_fasta(config["train_fasta"])
-    train_records = select_records(all_records, split_manifest["train_ids"])
-    val_records = select_records(all_records, split_manifest["val_ids"])
     caid_records = parse_three_line_fasta(config["caid_fasta"])
+    train_records, val_records, split_manifest, split_manifest_resolution, rebuilt_exclusion_report = _resolve_train_val_records(
+        all_records=all_records,
+        caid_records=caid_records,
+        split_manifest_path=config["split_manifest"],
+        source_fasta_path=config["train_fasta"],
+        error_file_path=config["error_file"],
+        seed=int(config["seed"]),
+        val_ratio=float(config["val_ratio"]),
+        auto_rebuild_on_mismatch=bool(config.get("auto_rebuild_split_on_mismatch", True)),
+        logger=log,
+    )
+    active_split_manifest_path = Path(config["split_manifest"])
+    rebuilt_exclusion_report_path: Path | None = None
+    if split_manifest_resolution["status"] == "rebuilt":
+        split_dir = output_dir / "splits"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        active_split_manifest_path = split_dir / "split_manifest_rebuilt.json"
+        write_json(active_split_manifest_path, split_manifest)
+        if rebuilt_exclusion_report is not None:
+            rebuilt_exclusion_report_path = split_dir / "exclusion_report_rebuilt.json"
+            write_json(rebuilt_exclusion_report_path, rebuilt_exclusion_report)
+        log(
+            "[split] rebuilt split manifest saved to "
+            f"{active_split_manifest_path} (train={len(train_records)} val={len(val_records)})"
+        )
 
     train_val_ids = {rec.protein_id for rec in train_records + val_records}
     caid_ids = {rec.protein_id for rec in caid_records}
@@ -1294,7 +1421,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
             "checkpoints_dir": str(ckpt_dir),
             "tensorboard_service": tensorboard_info,
             "wandb_service": wandb_info,
-            "split_manifest": str(Path(config["split_manifest"])),
+            "split_manifest": str(active_split_manifest_path),
+            "split_manifest_resolution": split_manifest_resolution,
+            "rebuilt_exclusion_report": str(rebuilt_exclusion_report_path) if rebuilt_exclusion_report_path else None,
             "train_records": len(train_records),
             "val_records": len(val_records),
             "caid_records": len(caid_records),
@@ -1322,6 +1451,8 @@ def train(config_path: str | Path) -> dict[str, Any]:
         "tensorboard_dir": str(tensorboard_dir),
         "tensorboard_service": tensorboard_info,
         "wandb_service": wandb_info,
+        "split_manifest": str(active_split_manifest_path),
+        "split_manifest_resolution": split_manifest_resolution,
         "log_file": str(logs_dir / "train.log"),
         "best_checkpoint": str(best_ckpt_path),
         "last_checkpoint": str(last_ckpt_path),
