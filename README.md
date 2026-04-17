@@ -7,6 +7,11 @@ Stage 1 provides a reproducible residue-level binary classifier pipeline for lin
 - **Training source:** DisProt (`dataset/disprot_202312_linker_label.fasta`)
 - **Holdout benchmark:** CAID3 (`dataset/linker.fasta`) used as strict final test only
 
+Stage 2 adds supervised contrastive learning on top of the same residue-level binary task:
+- **Objective:** `BCEWithLogits + SupCon` (joint loss)
+- **Training mode:** from scratch joint training (no Stage 1 checkpoint required)
+- **Backbone policy:** keep ProstT5 frozen by default, train classifier + projection head
+
 ## Stage 1 Pipeline
 The implementation includes:
 - strict 3-line FASTA parsing (`>id`, sequence, label string)
@@ -41,10 +46,44 @@ python -m cliper.cli prepare_data \
   --output-exclusion artifacts/splits/exclusion_report_seed42.json
 ```
 
-### 2) Train Stage 1 model
+### 2) Train Stage 1 model (BCE baseline)
 ```bash
 python -m cliper.cli train --config configs/stage1_prostt5.yaml
 ```
+
+### 2b) Train Stage 2 model (BCE + SupCon from scratch)
+```bash
+python -m cliper.cli train --config configs/stage2_prostt5_supcon.yaml
+```
+
+Stage 2 configuration keys:
+- `stage: stage2`
+- `contrastive.enabled`
+- `contrastive.weight`
+- `contrastive.temperature`
+- `contrastive.proj_dim`
+- `contrastive.max_samples_per_class`
+
+When Stage 2 is enabled, TensorBoard will additionally track:
+- `train/loss_bce`
+- `train/loss_supcon`
+- `train/loss_total`
+- `train/contrastive_num_samples`
+
+W&B（Weights & Biases）配置（按每次实验 YAML 生效参数记录）：
+- `use_wandb`
+- `wandb_entity`
+- `wandb_project`
+- `wandb_mode` (`online` / `offline` / `disabled`)
+- `wandb_run_name`
+- `wandb_group`
+- `wandb_tags`
+- `wandb_dir`（可选，默认写到实验目录下 `wandb/`）
+
+当 `use_wandb: true` 时：
+- 训练会自动创建 W&B run，`wandb.config` 写入当次实验实际生效配置（resolved YAML）
+- 训练/验证/CAID3 指标会同步上报到 W&B
+- `eval` 命令会创建独立的评测 run 并上报评测指标
 
 训练时若 `auto_start_tensorboard: true`（默认），会在服务器上启动 TensorBoard（`tensorboard_host` / `tensorboard_port`，见 `configs/stage1_prostt5.yaml`）。日志目录在当次实验子目录下：`artifacts/runs/<output_dir>/expXXXX/tensorboard/`。
 
@@ -96,6 +135,7 @@ python -m cliper.cli eval \
 - 周期 checkpoint: `artifacts/runs/.../expXXXX/checkpoints/step_*.pt`
 - 训练日志：`artifacts/runs/.../expXXXX/logs/train.log`
 - TensorBoard events：`artifacts/runs/.../expXXXX/tensorboard/`
+- W&B 本地运行缓存（启用时）：`artifacts/runs/.../expXXXX/wandb/`
 - 评测输出默认：`artifacts/runs/.../expXXXX/evaluations/evalXXXX/`
 - Training and validation metrics JSON
 - CAID3 metrics JSON
@@ -104,7 +144,9 @@ python -m cliper.cli eval \
 
 ## Notes
 - Default config in [`configs/stage1_prostt5.yaml`](configs/stage1_prostt5.yaml).
+- Stage 2 config template: [`configs/stage2_prostt5_supcon.yaml`](configs/stage2_prostt5_supcon.yaml).
 - For local tests without downloading a backbone, use `backbone_name: dummy` in config.
 - `save_every` / `print_every` / `eval_every` 默认单位是训练 step（global step）。
 - TensorBoard 自动启动相关参数：`auto_start_tensorboard` / `tensorboard_host` / `tensorboard_port`。
+- W&B 相关参数：`use_wandb` / `wandb_entity` / `wandb_project` / `wandb_mode` / `wandb_run_name` / `wandb_group` / `wandb_tags` / `wandb_dir`。
 - 远程端口转发：`scripts/forward_tensorboard.ps1`（Windows）、`scripts/forward_tensorboard.sh`（Linux/macOS/Git Bash）。

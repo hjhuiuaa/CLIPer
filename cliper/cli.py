@@ -7,7 +7,7 @@ from .pipeline import evaluate, prepare_data, train
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="CLIPer Stage 1 pipeline CLI")
+    parser = argparse.ArgumentParser(description="CLIPer training/evaluation pipeline CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     prepare_parser = subparsers.add_parser("prepare_data", help="Create deterministic train/val split and exclusion report.")
@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output JSON path for exclusion report.",
     )
 
-    train_parser = subparsers.add_parser("train", help="Train Stage 1 ProstT5 residue classifier.")
+    train_parser = subparsers.add_parser("train", help="Train CLIPer residue classifier (Stage 1 or Stage 2).")
     train_parser.add_argument("--config", required=True, help="YAML config path.")
 
     eval_parser = subparsers.add_parser("eval", help="Run evaluation using a saved checkpoint.")

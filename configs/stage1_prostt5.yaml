@@ -31,4 +31,11 @@ eval_every: 200
 auto_start_tensorboard: true
 tensorboard_host: 0.0.0.0
 tensorboard_port: 6006
+use_wandb: false
+wandb_entity: 3151599052-nankai-university
+wandb_project: CLIPer
+wandb_mode: online
+wandb_run_name: null
+wandb_group: stage1
+wandb_tags: [stage1, bce]
 

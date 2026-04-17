@@ -58,17 +58,36 @@ class DummyBackbone(nn.Module):
 
 
 class ResidueClassifier(nn.Module):
-    def __init__(self, backbone: nn.Module, hidden_size: int, dropout: float = 0.1, freeze_backbone: bool = True):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        hidden_size: int,
+        dropout: float = 0.1,
+        freeze_backbone: bool = True,
+        projection_dim: int = 128,
+    ):
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_size, 1)
+        self.projection_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, projection_dim),
+        )
         if self.freeze_backbone:
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, residue_lengths: list[int]) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        residue_lengths: list[int],
+        *,
+        return_embeddings: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.freeze_backbone:
             self.backbone.eval()
             with torch.no_grad():
@@ -83,8 +102,12 @@ class ResidueClassifier(nn.Module):
                 f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
             )
         residue_hidden = hidden[:, :max_len, :]
-        logits = self.classifier(self.dropout(residue_hidden)).squeeze(-1)
-        return logits
+        projected_input = self.dropout(residue_hidden)
+        logits = self.classifier(projected_input).squeeze(-1)
+        if not return_embeddings:
+            return logits
+        embeddings = self.projection_head(projected_input)
+        return logits, embeddings
 
 
 def _resolve_hidden_size(backbone: nn.Module) -> int:

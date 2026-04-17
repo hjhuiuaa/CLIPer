@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset
@@ -56,6 +57,7 @@ REQUIRED_CONFIG_FIELDS = [
 
 
 DEFAULTS = {
+    "stage": "stage1",
     "dropout": 0.1,
     "freeze_backbone": True,
     "val_ratio": 0.2,
@@ -74,6 +76,21 @@ DEFAULTS = {
     "auto_start_tensorboard": True,
     "tensorboard_host": "0.0.0.0",
     "tensorboard_port": 6006,
+    "use_wandb": False,
+    "wandb_entity": "3151599052-nankai-university",
+    "wandb_project": "CLIPer",
+    "wandb_mode": "online",
+    "wandb_run_name": None,
+    "wandb_group": None,
+    "wandb_tags": [],
+    "wandb_dir": None,
+    "contrastive": {
+        "enabled": False,
+        "weight": 0.2,
+        "temperature": 0.1,
+        "proj_dim": 128,
+        "max_samples_per_class": 256,
+    },
 }
 
 
@@ -113,6 +130,55 @@ def _ensure_required_fields(config: dict[str, Any]) -> None:
         raise ValueError(f"Missing required config fields: {missing}")
 
 
+def _resolve_contrastive_config(config: dict[str, Any], stage: str) -> dict[str, Any]:
+    defaults = dict(DEFAULTS["contrastive"])
+    provided = config.get("contrastive", {})
+    if provided is None:
+        provided = {}
+    if not isinstance(provided, dict):
+        raise ValueError("contrastive must be a dict when provided.")
+    defaults.update(provided)
+    if stage == "stage2" and "enabled" not in provided:
+        defaults["enabled"] = True
+    if float(defaults["weight"]) < 0:
+        raise ValueError(f"contrastive.weight must be >= 0, got {defaults['weight']}")
+    if float(defaults["temperature"]) <= 0:
+        raise ValueError(f"contrastive.temperature must be > 0, got {defaults['temperature']}")
+    if int(defaults["proj_dim"]) <= 0:
+        raise ValueError(f"contrastive.proj_dim must be > 0, got {defaults['proj_dim']}")
+    if int(defaults["max_samples_per_class"]) <= 0:
+        raise ValueError(
+            "contrastive.max_samples_per_class must be > 0, "
+            f"got {defaults['max_samples_per_class']}"
+        )
+    return defaults
+
+
+def _resolve_wandb_tags(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        return [stripped] if stripped else []
+    if isinstance(raw, (list, tuple)):
+        tags: list[str] = []
+        for item in raw:
+            if item is None:
+                continue
+            value = str(item).strip()
+            if value:
+                tags.append(value)
+        return tags
+    raise ValueError("wandb_tags must be a list/tuple of strings or a single string.")
+
+
+def _optional_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     config = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -121,8 +187,24 @@ def load_config(path: str | Path) -> dict[str, Any]:
     _ensure_required_fields(config)
     merged = dict(DEFAULTS)
     merged.update(config)
+    stage = str(merged.get("stage", "stage1")).lower()
+    if stage not in {"stage1", "stage2"}:
+        raise ValueError(f"stage must be one of ['stage1', 'stage2'], got {stage!r}")
+    merged["stage"] = stage
+    merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
     if merged["optimizer"].lower() != "adamw":
-        raise ValueError("Only optimizer=adamw is supported in Stage 1.")
+        raise ValueError("Only optimizer=adamw is supported.")
+    wandb_mode = str(merged.get("wandb_mode", "online")).lower()
+    if wandb_mode not in {"online", "offline", "disabled"}:
+        raise ValueError(
+            "wandb_mode must be one of ['online', 'offline', 'disabled'], "
+            f"got {wandb_mode!r}"
+        )
+    merged["wandb_mode"] = wandb_mode
+    merged["wandb_tags"] = _resolve_wandb_tags(merged.get("wandb_tags"))
+    if bool(merged.get("use_wandb", False)):
+        if not str(merged.get("wandb_project", "")).strip():
+            raise ValueError("use_wandb=true requires non-empty wandb_project.")
     threshold_search = merged["threshold_search"]
     if not isinstance(threshold_search, dict):
         raise ValueError("threshold_search must be a dict with min/max/step.")
@@ -181,6 +263,24 @@ def _save_checkpoint(
         },
         target,
     )
+
+
+def _load_model_state(
+    model: nn.Module,
+    state_dict: dict[str, Any],
+    *,
+    logger=None,
+) -> None:
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    allowed_missing_prefixes = ("projection_head.",)
+    disallowed_missing = [name for name in missing if not name.startswith(allowed_missing_prefixes)]
+    if disallowed_missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint state mismatch. "
+            f"missing={disallowed_missing}, unexpected={unexpected}"
+        )
+    if missing and logger is not None:
+        logger(f"[checkpoint] missing optional params during load: {missing}")
 
 
 def _port_probe_host(host: str) -> str:
@@ -283,6 +383,96 @@ def _start_tensorboard_if_needed(
     }
 
 
+def _start_wandb_if_needed(
+    *,
+    enabled: bool,
+    project: str | None,
+    entity: str | None,
+    run_name: str | None,
+    group: str | None,
+    tags: list[str],
+    mode: str,
+    run_dir: str | Path | None,
+    job_type: str,
+    config_payload: dict[str, Any],
+    logger,
+) -> tuple[Any | None, dict[str, Any]]:
+    if not enabled:
+        logger("[wandb] disabled by config.")
+        return None, {
+            "status": "disabled",
+            "project": project,
+            "entity": entity,
+            "run_id": None,
+            "run_name": None,
+            "mode": mode,
+            "url": None,
+            "dir": None,
+        }
+
+    resolved_project = str(project or "").strip()
+    if not resolved_project:
+        raise ValueError("W&B is enabled but wandb_project is empty.")
+    resolved_entity = str(entity).strip() if entity else None
+    resolved_name = str(run_name).strip() if run_name else None
+    resolved_group = str(group).strip() if group else None
+    resolved_dir = Path(run_dir) if run_dir else Path.cwd() / "wandb"
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError(
+            "W&B is enabled but dependency `wandb` is missing. "
+            "Install with: pip install wandb"
+        ) from exc
+
+    run = wandb.init(
+        project=resolved_project,
+        entity=resolved_entity,
+        name=resolved_name,
+        group=resolved_group,
+        tags=tags or None,
+        mode=mode,
+        dir=str(resolved_dir),
+        config=config_payload,
+        job_type=job_type,
+    )
+    run_id = getattr(run, "id", None)
+    actual_name = getattr(run, "name", None)
+    url = getattr(run, "url", None)
+    logger(f"[wandb] started run_id={run_id} run_name={actual_name} mode={mode}")
+    return run, {
+        "status": "started",
+        "project": resolved_project,
+        "entity": resolved_entity,
+        "run_id": run_id,
+        "run_name": actual_name,
+        "mode": mode,
+        "url": url,
+        "dir": str(resolved_dir),
+    }
+
+
+def _wandb_log(run: Any | None, payload: dict[str, Any], *, step: int | None = None) -> None:
+    if run is None:
+        return
+    if step is None:
+        run.log(payload)
+    else:
+        run.log(payload, step=step)
+
+
+def _finish_wandb(run: Any | None, logger) -> None:
+    if run is None:
+        return
+    try:
+        run.finish()
+        logger("[wandb] run finished.")
+    except Exception as exc:  # pragma: no cover - defensive cleanup
+        logger(f"[wandb] failed to finish run cleanly: {exc}")
+
+
 def _infer_experiment_dir_from_checkpoint(checkpoint_path: str | Path) -> Path:
     checkpoint = Path(checkpoint_path).resolve()
     if checkpoint.parent.name == "checkpoints":
@@ -349,6 +539,111 @@ def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> t
             else:
                 labels_tensor[row, idx] = -100.0
     return labels_tensor
+
+
+def _sample_contrastive_residues(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    max_samples_per_class: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    valid_mask = labels >= 0
+    if int(valid_mask.sum().item()) == 0:
+        empty_embeddings = embeddings.new_zeros((0, embeddings.shape[-1]))
+        empty_labels = labels.new_zeros((0,), dtype=torch.long)
+        return empty_embeddings, empty_labels
+
+    flat_embeddings = embeddings[valid_mask]
+    flat_labels = labels[valid_mask].to(dtype=torch.long)
+    sampled_embeddings: list[torch.Tensor] = []
+    sampled_labels: list[torch.Tensor] = []
+
+    for class_id in (0, 1):
+        class_mask = flat_labels == class_id
+        class_count = int(class_mask.sum().item())
+        if class_count == 0:
+            continue
+        class_embeddings = flat_embeddings[class_mask]
+        if class_count > max_samples_per_class:
+            perm = torch.randperm(class_count, device=class_embeddings.device)[:max_samples_per_class]
+            class_embeddings = class_embeddings[perm]
+        sampled_embeddings.append(class_embeddings)
+        sampled_labels.append(
+            torch.full(
+                (class_embeddings.shape[0],),
+                class_id,
+                device=flat_labels.device,
+                dtype=torch.long,
+            )
+        )
+
+    if not sampled_embeddings:
+        empty_embeddings = embeddings.new_zeros((0, embeddings.shape[-1]))
+        empty_labels = labels.new_zeros((0,), dtype=torch.long)
+        return empty_embeddings, empty_labels
+
+    return torch.cat(sampled_embeddings, dim=0), torch.cat(sampled_labels, dim=0)
+
+
+def _supervised_contrastive_loss(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    temperature: float,
+) -> torch.Tensor:
+    if embeddings.ndim != 2:
+        raise ValueError(f"Expected 2D embeddings [N, D], got shape={tuple(embeddings.shape)}")
+    num_samples = embeddings.shape[0]
+    if num_samples < 2:
+        return embeddings.new_zeros(())
+
+    normalized = F.normalize(embeddings, p=2, dim=1)
+    logits = torch.matmul(normalized, normalized.T) / temperature
+    logits = logits - logits.max(dim=1, keepdim=True).values.detach()
+
+    labels = labels.view(-1, 1)
+    positive_mask = torch.eq(labels, labels.T).to(dtype=logits.dtype)
+    logits_mask = torch.ones_like(positive_mask) - torch.eye(num_samples, device=logits.device, dtype=logits.dtype)
+    positive_mask = positive_mask * logits_mask
+
+    exp_logits = torch.exp(logits) * logits_mask
+    denominator = exp_logits.sum(dim=1, keepdim=True)
+    log_prob = logits - torch.log(denominator + 1e-12)
+
+    positive_count = positive_mask.sum(dim=1)
+    valid = positive_count > 0
+    if int(valid.sum().item()) == 0:
+        return embeddings.new_zeros(())
+
+    mean_log_prob_pos = (positive_mask * log_prob).sum(dim=1) / positive_count.clamp_min(1.0)
+    loss = -mean_log_prob_pos[valid].mean()
+    return loss
+
+
+def _compute_batch_supcon_loss(
+    residue_embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    max_samples_per_class: int,
+    temperature: float,
+) -> tuple[torch.Tensor, int]:
+    sampled_embeddings, sampled_labels = _sample_contrastive_residues(
+        residue_embeddings,
+        labels,
+        max_samples_per_class=max_samples_per_class,
+    )
+    sampled_count = int(sampled_labels.shape[0])
+    class_count = int(sampled_labels.unique().shape[0]) if sampled_count > 0 else 0
+    if sampled_count < 2 or class_count < 2:
+        return residue_embeddings.new_zeros(()), sampled_count
+    loss = _supervised_contrastive_loss(
+        sampled_embeddings,
+        sampled_labels,
+        temperature=temperature,
+    )
+    if not torch.isfinite(loss):
+        raise ValueError("SupCon loss became non-finite; please check training hyperparameters.")
+    return loss, sampled_count
 
 
 def _batched_forward(
@@ -502,6 +797,12 @@ def _compute_pos_weight(records: list[ProteinRecord]) -> tuple[float, dict[str, 
 def train(config_path: str | Path) -> dict[str, Any]:
     config = load_config(config_path)
     set_seed(int(config["seed"]))
+    stage = str(config.get("stage", "stage1"))
+    contrastive_cfg = dict(config.get("contrastive", {}))
+    contrastive_enabled = bool(contrastive_cfg.get("enabled", False))
+    contrastive_weight = float(contrastive_cfg.get("weight", 0.0)) if contrastive_enabled else 0.0
+    contrastive_temperature = float(contrastive_cfg.get("temperature", 0.1))
+    contrastive_max_samples = int(contrastive_cfg.get("max_samples_per_class", 256))
 
     device = torch.device(config["device"])
     use_amp = device.type == "cuda"
@@ -523,6 +824,10 @@ def train(config_path: str | Path) -> dict[str, Any]:
 
     log = _build_logger(logs_dir / "train.log")
     log(f"Run started: run_id={run_id} output_dir={output_dir}")
+    log(
+        f"Run stage={stage} contrastive_enabled={contrastive_enabled} "
+        f"contrastive_weight={contrastive_weight:.4f}"
+    )
     tensorboard_info = _start_tensorboard_if_needed(
         enabled=bool(config.get("auto_start_tensorboard", True)),
         logdir=output_base_dir,
@@ -534,9 +839,24 @@ def train(config_path: str | Path) -> dict[str, Any]:
 
     writer = SummaryWriter(log_dir=str(tensorboard_dir))
     writer.add_text("run/id", run_id, 0)
+    writer.add_text("run/stage", stage, 0)
     writer.add_text("run/config_path", str(Path(config_path)), 0)
     writer.add_text("run/config_resolved", json.dumps(config_resolved, ensure_ascii=False, indent=2), 0)
     writer.add_text("tensorboard/service", json.dumps(tensorboard_info, ensure_ascii=False, indent=2), 0)
+    wandb_run, wandb_info = _start_wandb_if_needed(
+        enabled=bool(config.get("use_wandb", False)),
+        project=_optional_str(config.get("wandb_project")),
+        entity=_optional_str(config.get("wandb_entity")),
+        run_name=_optional_str(config.get("wandb_run_name")) or run_id,
+        group=_optional_str(config.get("wandb_group")),
+        tags=list(config.get("wandb_tags", [])),
+        mode=str(config.get("wandb_mode", "online")),
+        run_dir=config.get("wandb_dir") or (output_dir / "wandb"),
+        job_type="train",
+        config_payload=config_resolved,
+        logger=log,
+    )
+    writer.add_text("wandb/service", json.dumps(wandb_info, ensure_ascii=False, indent=2), 0)
 
     split_manifest = read_json(config["split_manifest"])
     all_records = parse_three_line_fasta(config["train_fasta"])
@@ -558,6 +878,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
         hidden_size=hidden_size,
         dropout=float(config["dropout"]),
         freeze_backbone=bool(config["freeze_backbone"]),
+        projection_dim=int(contrastive_cfg["proj_dim"]),
     ).to(device)
 
     batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
@@ -590,6 +911,18 @@ def train(config_path: str | Path) -> dict[str, Any]:
     writer.add_scalar("data/class_positive", class_stats["positive"], 0)
     writer.add_scalar("data/class_negative", class_stats["negative"], 0)
     writer.add_scalar("train/pos_weight", pos_weight, 0)
+    writer.add_scalar("train/contrastive_weight", contrastive_weight, 0)
+    _wandb_log(
+        wandb_run,
+        {
+            "data/class_positive": class_stats["positive"],
+            "data/class_negative": class_stats["negative"],
+            "train/pos_weight": pos_weight,
+            "train/contrastive_weight": contrastive_weight,
+            "run/stage": stage,
+        },
+        step=0,
+    )
 
     best_auprc = -1.0
     best_epoch = -1
@@ -644,6 +977,16 @@ def train(config_path: str | Path) -> dict[str, Any]:
         writer.add_scalar("val/f1", float(val_metrics["f1"]), step)
         writer.add_scalar("val/mcc", float(val_metrics["mcc"]), step)
         writer.add_scalar("val/threshold", float(val_threshold), step)
+        _wandb_log(
+            wandb_run,
+            {
+                "val/auprc": float(val_metrics["auprc"]),
+                "val/f1": float(val_metrics["f1"]),
+                "val/mcc": float(val_metrics["mcc"]),
+                "val/threshold": float(val_threshold),
+            },
+            step=step,
+        )
         log(
             "[eval] "
             f"reason={reason} epoch={epoch} step={step} "
@@ -676,9 +1019,13 @@ def train(config_path: str | Path) -> dict[str, Any]:
         for epoch in range(1, int(config["max_epochs"]) + 1):
             model.train()
             start_time = time.time()
-            running_loss = 0.0
+            running_total_loss = 0.0
+            running_bce_loss = 0.0
+            running_supcon_loss = 0.0
             steps = 0
-            window_loss = 0.0
+            window_total_loss = 0.0
+            window_bce_loss = 0.0
+            window_supcon_loss = 0.0
             window_steps = 0
             eval_happened_in_epoch = False
 
@@ -690,35 +1037,94 @@ def train(config_path: str | Path) -> dict[str, Any]:
 
                 optimizer.zero_grad(set_to_none=True)
                 with _autocast_context(device_type=device.type, enabled=use_amp):
-                    logits = model(input_ids=input_ids, attention_mask=attention_mask, residue_lengths=residue_lengths)
+                    if contrastive_enabled:
+                        logits, residue_embeddings = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            residue_lengths=residue_lengths,
+                            return_embeddings=True,
+                        )
+                    else:
+                        logits = model(input_ids=input_ids, attention_mask=attention_mask, residue_lengths=residue_lengths)
+                        residue_embeddings = None
                     mask = labels >= 0
                     valid_count = int(mask.sum().item())
                     if valid_count == 0:
                         continue
                     loss_matrix = criterion(logits, labels)
-                    loss = (loss_matrix * mask).sum() / valid_count
+                    bce_loss = (loss_matrix * mask).sum() / valid_count
 
-                scaler.scale(loss).backward()
+                    contrastive_num_samples = 0
+                    if contrastive_enabled and residue_embeddings is not None:
+                        supcon_loss, contrastive_num_samples = _compute_batch_supcon_loss(
+                            residue_embeddings,
+                            labels,
+                            max_samples_per_class=contrastive_max_samples,
+                            temperature=contrastive_temperature,
+                        )
+                    else:
+                        supcon_loss = bce_loss.new_zeros(())
+                    total_loss = bce_loss + contrastive_weight * supcon_loss
+
+                scaler.scale(total_loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
 
-                loss_value = float(loss.detach().cpu().item())
+                total_loss_value = float(total_loss.detach().cpu().item())
+                bce_loss_value = float(bce_loss.detach().cpu().item())
+                supcon_loss_value = float(supcon_loss.detach().cpu().item())
                 global_step += 1
-                running_loss += loss_value
+                running_total_loss += total_loss_value
+                running_bce_loss += bce_loss_value
+                running_supcon_loss += supcon_loss_value
                 steps += 1
-                window_loss += loss_value
+                window_total_loss += total_loss_value
+                window_bce_loss += bce_loss_value
+                window_supcon_loss += supcon_loss_value
                 window_steps += 1
 
-                writer.add_scalar("train/loss_step", loss_value, global_step)
+                writer.add_scalar("train/loss_step", total_loss_value, global_step)
+                writer.add_scalar("train/loss_total", total_loss_value, global_step)
+                writer.add_scalar("train/loss_bce", bce_loss_value, global_step)
+                writer.add_scalar("train/loss_supcon", supcon_loss_value, global_step)
+                writer.add_scalar("train/contrastive_num_samples", contrastive_num_samples, global_step)
                 writer.add_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), global_step)
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "train/loss_step": total_loss_value,
+                        "train/loss_total": total_loss_value,
+                        "train/loss_bce": bce_loss_value,
+                        "train/loss_supcon": supcon_loss_value,
+                        "train/contrastive_num_samples": contrastive_num_samples,
+                        "train/lr": float(optimizer.param_groups[0]["lr"]),
+                    },
+                    step=global_step,
+                )
 
                 if global_step % print_every == 0:
-                    avg_window_loss = window_loss / max(1, window_steps)
-                    print_event = {"epoch": epoch, "global_step": global_step, "avg_loss": avg_window_loss}
+                    avg_window_total = window_total_loss / max(1, window_steps)
+                    avg_window_bce = window_bce_loss / max(1, window_steps)
+                    avg_window_supcon = window_supcon_loss / max(1, window_steps)
+                    print_event = {
+                        "epoch": epoch,
+                        "global_step": global_step,
+                        "avg_loss": avg_window_total,
+                        "avg_bce_loss": avg_window_bce,
+                        "avg_supcon_loss": avg_window_supcon,
+                    }
                     print_history.append(print_event)
-                    log(f"[train] epoch={epoch} step={global_step} avg_loss={avg_window_loss:.6f}")
-                    writer.add_scalar("train/loss_print_avg", avg_window_loss, global_step)
-                    window_loss = 0.0
+                    log(
+                        f"[train] epoch={epoch} step={global_step} "
+                        f"avg_total={avg_window_total:.6f} avg_bce={avg_window_bce:.6f} "
+                        f"avg_supcon={avg_window_supcon:.6f}"
+                    )
+                    writer.add_scalar("train/loss_print_avg", avg_window_total, global_step)
+                    writer.add_scalar("train/loss_bce_print_avg", avg_window_bce, global_step)
+                    writer.add_scalar("train/loss_supcon_print_avg", avg_window_supcon, global_step)
+                    window_total_loss = 0.0
+                    window_bce_loss = 0.0
+                    window_supcon_loss = 0.0
                     window_steps = 0
 
                 if global_step % save_every == 0:
@@ -746,28 +1152,59 @@ def train(config_path: str | Path) -> dict[str, Any]:
                         break
 
             if window_steps > 0:
-                avg_window_loss = window_loss / max(1, window_steps)
-                print_event = {"epoch": epoch, "global_step": global_step, "avg_loss": avg_window_loss}
+                avg_window_total = window_total_loss / max(1, window_steps)
+                avg_window_bce = window_bce_loss / max(1, window_steps)
+                avg_window_supcon = window_supcon_loss / max(1, window_steps)
+                print_event = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "avg_loss": avg_window_total,
+                    "avg_bce_loss": avg_window_bce,
+                    "avg_supcon_loss": avg_window_supcon,
+                }
                 print_history.append(print_event)
-                log(f"[train] epoch={epoch} step={global_step} avg_loss={avg_window_loss:.6f} (epoch_end_flush)")
-                writer.add_scalar("train/loss_print_avg", avg_window_loss, global_step)
+                log(
+                    f"[train] epoch={epoch} step={global_step} avg_total={avg_window_total:.6f} "
+                    f"avg_bce={avg_window_bce:.6f} avg_supcon={avg_window_supcon:.6f} (epoch_end_flush)"
+                )
+                writer.add_scalar("train/loss_print_avg", avg_window_total, global_step)
+                writer.add_scalar("train/loss_bce_print_avg", avg_window_bce, global_step)
+                writer.add_scalar("train/loss_supcon_print_avg", avg_window_supcon, global_step)
 
-            train_loss = running_loss / max(1, steps)
+            train_loss = running_total_loss / max(1, steps)
+            train_bce_loss = running_bce_loss / max(1, steps)
+            train_supcon_loss = running_supcon_loss / max(1, steps)
             epoch_seconds = round(time.time() - start_time, 3)
             history.append(
                 {
                     "epoch": epoch,
                     "global_step": global_step,
                     "train_loss": train_loss,
+                    "train_bce_loss": train_bce_loss,
+                    "train_supcon_loss": train_supcon_loss,
                     "epoch_seconds": epoch_seconds,
                     "train_steps": steps,
                 }
             )
             writer.add_scalar("train/loss_epoch", train_loss, epoch)
+            writer.add_scalar("train/loss_bce_epoch", train_bce_loss, epoch)
+            writer.add_scalar("train/loss_supcon_epoch", train_supcon_loss, epoch)
             writer.add_scalar("train/epoch_seconds", epoch_seconds, epoch)
+            _wandb_log(
+                wandb_run,
+                {
+                    "train/loss_epoch": train_loss,
+                    "train/loss_bce_epoch": train_bce_loss,
+                    "train/loss_supcon_epoch": train_supcon_loss,
+                    "train/epoch_seconds": epoch_seconds,
+                    "train/epoch": epoch,
+                },
+                step=global_step,
+            )
             log(
                 f"[epoch] epoch={epoch} steps={steps} global_step={global_step} "
-                f"train_loss={train_loss:.6f} epoch_seconds={epoch_seconds:.3f}"
+                f"train_total={train_loss:.6f} train_bce={train_bce_loss:.6f} "
+                f"train_supcon={train_supcon_loss:.6f} epoch_seconds={epoch_seconds:.3f}"
             )
 
             if stop_training:
@@ -826,7 +1263,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
     log(f"[save] last checkpoint saved: {last_ckpt_path.name}")
 
     checkpoint = torch.load(best_ckpt_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state"])
+    _load_model_state(model, checkpoint["model_state"], logger=log)
     best_threshold = float(checkpoint.get("threshold", best_threshold))
     best_step = int(checkpoint.get("global_step", best_step))
 
@@ -858,6 +1295,16 @@ def train(config_path: str | Path) -> dict[str, Any]:
     writer.add_scalar("caid3/mcc", float(caid_eval["metrics"]["mcc"]), global_step)
     writer.flush()
     writer.close()
+    _wandb_log(
+        wandb_run,
+        {
+            "caid3/auprc": float(caid_eval["metrics"]["auprc"]),
+            "caid3/f1": float(caid_eval["metrics"]["f1"]),
+            "caid3/mcc": float(caid_eval["metrics"]["mcc"]),
+            "caid3/threshold": float(caid_eval["metrics"]["threshold"]),
+        },
+        step=global_step,
+    )
 
     write_json(
         metrics_dir / "train_history.json",
@@ -889,12 +1336,15 @@ def train(config_path: str | Path) -> dict[str, Any]:
             "log_file": str(logs_dir / "train.log"),
             "checkpoints_dir": str(ckpt_dir),
             "tensorboard_service": tensorboard_info,
+            "wandb_service": wandb_info,
             "split_manifest": str(Path(config["split_manifest"])),
             "train_records": len(train_records),
             "val_records": len(val_records),
             "caid_records": len(caid_records),
             "class_stats_train": class_stats,
             "pos_weight": pos_weight,
+            "stage": stage,
+            "contrastive": contrastive_cfg,
             "global_steps": global_step,
             "save_every": save_every,
             "print_every": print_every,
@@ -906,6 +1356,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
             "selected_threshold": best_threshold,
         },
     )
+    _finish_wandb(wandb_run, logger=log)
 
     return {
         "run_id": run_id,
@@ -913,6 +1364,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
         "output_base_dir": str(output_base_dir),
         "tensorboard_dir": str(tensorboard_dir),
         "tensorboard_service": tensorboard_info,
+        "wandb_service": wandb_info,
         "log_file": str(logs_dir / "train.log"),
         "best_checkpoint": str(best_ckpt_path),
         "last_checkpoint": str(last_ckpt_path),
@@ -920,6 +1372,8 @@ def train(config_path: str | Path) -> dict[str, Any]:
         "best_step": best_step,
         "global_steps": global_step,
         "best_val_auprc": best_auprc,
+        "stage": stage,
+        "contrastive": contrastive_cfg,
         "caid3_metrics": caid_eval["metrics"],
     }
 
@@ -960,6 +1414,31 @@ def evaluate(
 
     if batch_size is None:
         batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
+    eval_id_for_name = eval_id if eval_id is not None else output.name
+    wandb_eval_config = {
+        "checkpoint_path": str(Path(checkpoint_path)),
+        "fasta_path": str(Path(fasta_path)),
+        "split_manifest_path": str(Path(split_manifest_path)) if split_manifest_path else None,
+        "split_key": split_key,
+        "batch_size": batch_size,
+        "threshold_override": threshold,
+        "experiment_dir": str(experiment_dir),
+        "eval_output_dir": str(output),
+        "train_config": config,
+    }
+    wandb_run, wandb_info = _start_wandb_if_needed(
+        enabled=bool(config.get("use_wandb", False)),
+        project=_optional_str(config.get("wandb_project")),
+        entity=_optional_str(config.get("wandb_entity")),
+        run_name=f"{config.get('run_id', experiment_dir.name)}-{eval_id_for_name}-eval",
+        group=_optional_str(config.get("wandb_group")),
+        tags=list(config.get("wandb_tags", [])) + ["eval"],
+        mode=str(config.get("wandb_mode", "online")),
+        run_dir=config.get("wandb_dir") or (experiment_dir / "wandb"),
+        job_type="eval",
+        config_payload=wandb_eval_config,
+        logger=log,
+    )
 
     records = parse_three_line_fasta(fasta_path)
     if split_manifest_path and split_key:
@@ -974,8 +1453,9 @@ def evaluate(
         hidden_size=hidden_size,
         dropout=float(config.get("dropout", 0.1)),
         freeze_backbone=bool(config.get("freeze_backbone", True)),
+        projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
     )
-    model.load_state_dict(checkpoint["model_state"])
+    _load_model_state(model, checkpoint["model_state"], logger=log)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
 
@@ -994,6 +1474,17 @@ def evaluate(
         threshold_search=config["threshold_search"],
         mixed_precision=(device.type == "cuda"),
     )
+    _wandb_log(
+        wandb_run,
+        {
+            "eval/auprc": float(result["metrics"]["auprc"]),
+            "eval/f1": float(result["metrics"]["f1"]),
+            "eval/mcc": float(result["metrics"]["mcc"]),
+            "eval/threshold": float(result["metrics"]["threshold"]),
+            "eval/num_records": int(result["metrics"]["num_records"]),
+            "eval/num_scored_residues": int(result["metrics"]["num_scored_residues"]),
+        },
+    )
 
     predictions_path = output / "predictions.tsv"
     metrics_path = output / "metrics.json"
@@ -1007,6 +1498,7 @@ def evaluate(
             "output_dir": str(output),
             "eval_id": eval_id,
             "tensorboard_service": tensorboard_info,
+            "wandb_service": wandb_info,
             "fasta_path": str(Path(fasta_path)),
             "split_manifest_path": str(Path(split_manifest_path)) if split_manifest_path else None,
             "split_key": split_key,
@@ -1021,12 +1513,14 @@ def evaluate(
         f"f1={result['metrics']['f1']:.6f} "
         f"mcc={result['metrics']['mcc']:.6f}"
     )
+    _finish_wandb(wandb_run, logger=log)
 
     return {
         "experiment_dir": str(experiment_dir),
         "eval_id": eval_id,
         "output_dir": str(output),
         "tensorboard_service": tensorboard_info,
+        "wandb_service": wandb_info,
         "predictions_path": str(predictions_path),
         "metrics_path": str(metrics_path),
         "metrics": result["metrics"],
