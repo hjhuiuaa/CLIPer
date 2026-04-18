@@ -27,8 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output JSON path for exclusion report.",
     )
 
-    train_parser = subparsers.add_parser("train", help="Train CLIPer residue classifier (Stage 1 or Stage 2).")
+    train_parser = subparsers.add_parser("train", help="Train CLIPer residue classifier (Stage 1/2/3).")
     train_parser.add_argument("--config", required=True, help="YAML config path.")
+    train_parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="Optional checkpoint path to resume training state.",
+    )
 
     eval_parser = subparsers.add_parser("eval", help="Run evaluation using a saved checkpoint.")
     eval_parser.add_argument("--checkpoint", required=True, help="Path to checkpoint .pt file.")
@@ -61,7 +66,10 @@ def main(argv: list[str] | None = None) -> int:
             exclusion_out=args.output_exclusion,
         )
     elif args.command == "train":
-        result = train(config_path=args.config)
+        result = train(
+            config_path=args.config,
+            resume_checkpoint=args.resume_checkpoint,
+        )
     elif args.command == "eval":
         result = evaluate(
             checkpoint_path=args.checkpoint,

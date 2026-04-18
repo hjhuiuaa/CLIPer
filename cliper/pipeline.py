@@ -63,6 +63,8 @@ DEFAULTS = {
     "val_ratio": 0.2,
     "error_file": "dataset/error.txt",
     "auto_rebuild_split_on_mismatch": True,
+    "resume_checkpoint": None,
+    "resume_output_strategy": "same_experiment",
     "eval_stride": None,
     "top_k_heuristic": 4,
     "num_workers": 0,
@@ -86,6 +88,17 @@ DEFAULTS = {
     "wandb_group": None,
     "wandb_tags": [],
     "wandb_dir": None,
+    "classifier_head": {
+        "type": "linear",
+        "dropout": 0.3,
+        "use_layernorm": True,
+        "activation": "relu",
+        "hidden_dims": [1024, 256, 128, 64],
+        "num_layers": 2,
+        "num_heads": 4,
+        "ffn_dim": 2048,
+        "use_positional_encoding": True,
+    },
     "contrastive": {
         "enabled": False,
         "weight": 0.2,
@@ -156,6 +169,74 @@ def _resolve_contrastive_config(config: dict[str, Any], stage: str) -> dict[str,
     return defaults
 
 
+def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
+    defaults = dict(DEFAULTS["classifier_head"])
+    provided = config.get("classifier_head", {})
+    if provided is None:
+        provided = {}
+    if not isinstance(provided, dict):
+        raise ValueError("classifier_head must be a dict when provided.")
+    defaults.update(provided)
+
+    head_type = str(defaults.get("type", "linear")).lower()
+    if head_type not in {"linear", "mlp5", "mlp12", "transformer"}:
+        raise ValueError(
+            "classifier_head.type must be one of ['linear', 'mlp5', 'mlp12', 'transformer'], "
+            f"got {head_type!r}"
+        )
+    defaults["type"] = head_type
+
+    dropout = float(defaults.get("dropout", 0.3))
+    if not (0.0 <= dropout < 1.0):
+        raise ValueError(f"classifier_head.dropout must be in [0, 1), got {dropout}")
+    defaults["dropout"] = dropout
+
+    activation = str(defaults.get("activation", "relu")).lower()
+    if activation not in {"relu", "gelu"}:
+        raise ValueError(f"classifier_head.activation must be one of ['relu', 'gelu'], got {activation!r}")
+    defaults["activation"] = activation
+    defaults["use_layernorm"] = bool(defaults.get("use_layernorm", True))
+    defaults["use_positional_encoding"] = bool(defaults.get("use_positional_encoding", True))
+
+    if head_type in {"mlp5", "mlp12"}:
+        if "hidden_dims" not in provided:
+            if head_type == "mlp5":
+                defaults["hidden_dims"] = [1024, 256, 128, 64]
+            else:
+                defaults["hidden_dims"] = [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64]
+        hidden_dims = defaults.get("hidden_dims", [1024, 256, 128, 64])
+        if not isinstance(hidden_dims, list) or len(hidden_dims) == 0:
+            raise ValueError("classifier_head.hidden_dims must be a non-empty list.")
+        hidden_dims = [int(dim) for dim in hidden_dims]
+        if any(dim <= 0 for dim in hidden_dims):
+            raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims!r}")
+        defaults["hidden_dims"] = hidden_dims
+        expected_hidden_layers = {"mlp5": 4, "mlp12": 11}
+        if len(hidden_dims) != expected_hidden_layers[head_type]:
+            raise ValueError(
+                f"classifier_head.hidden_dims for {head_type} must contain exactly "
+                f"{expected_hidden_layers[head_type]} integers, got {hidden_dims!r}"
+            )
+    else:
+        defaults["hidden_dims"] = []
+
+    if head_type == "transformer":
+        num_layers = int(defaults.get("num_layers", 2))
+        num_heads = int(defaults.get("num_heads", 4))
+        ffn_dim = int(defaults.get("ffn_dim", 2048))
+        if num_layers <= 0:
+            raise ValueError(f"classifier_head.num_layers must be > 0, got {num_layers}")
+        if num_heads <= 0:
+            raise ValueError(f"classifier_head.num_heads must be > 0, got {num_heads}")
+        if ffn_dim <= 0:
+            raise ValueError(f"classifier_head.ffn_dim must be > 0, got {ffn_dim}")
+        defaults["num_layers"] = num_layers
+        defaults["num_heads"] = num_heads
+        defaults["ffn_dim"] = ffn_dim
+
+    return defaults
+
+
 def _resolve_wandb_tags(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -190,13 +271,25 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     merged.update(config)
     stage = str(merged.get("stage", "stage1")).lower()
-    if stage not in {"stage1", "stage2"}:
-        raise ValueError(f"stage must be one of ['stage1', 'stage2'], got {stage!r}")
+    if stage not in {"stage1", "stage2", "stage3"}:
+        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3'], got {stage!r}")
     merged["stage"] = stage
     merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
+    merged["classifier_head"] = _resolve_classifier_head_config(config)
+    merged["stage3_contrastive_forced_off"] = False
+    if stage == "stage3" and bool(merged["contrastive"].get("enabled", False)):
+        merged["contrastive"]["enabled"] = False
+        merged["stage3_contrastive_forced_off"] = True
     if merged["optimizer"].lower() != "adamw":
         raise ValueError("Only optimizer=adamw is supported.")
     merged["auto_rebuild_split_on_mismatch"] = bool(merged.get("auto_rebuild_split_on_mismatch", True))
+    resume_output_strategy = str(merged.get("resume_output_strategy", "same_experiment")).lower()
+    if resume_output_strategy != "same_experiment":
+        raise ValueError(
+            "resume_output_strategy only supports 'same_experiment' currently, "
+            f"got {resume_output_strategy!r}."
+        )
+    merged["resume_output_strategy"] = resume_output_strategy
     wandb_mode = str(merged.get("wandb_mode", "online")).lower()
     if wandb_mode not in {"online", "offline", "disabled"}:
         raise ValueError(
@@ -252,20 +345,27 @@ def _save_checkpoint(
     best_val_auprc: float,
     threshold: float,
     config: dict[str, Any],
+    optimizer: AdamW | None = None,
+    scaler: Any | None = None,
+    train_state: dict[str, Any] | None = None,
 ) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "global_step": global_step,
-            "model_state": model.state_dict(),
-            "best_val_auprc": best_val_auprc,
-            "threshold": threshold,
-            "config": config,
-        },
-        target,
-    )
+    payload: dict[str, Any] = {
+        "epoch": epoch,
+        "global_step": global_step,
+        "model_state": model.state_dict(),
+        "best_val_auprc": best_val_auprc,
+        "threshold": threshold,
+        "config": config,
+    }
+    if optimizer is not None:
+        payload["optimizer_state"] = optimizer.state_dict()
+    if scaler is not None:
+        payload["scaler_state"] = scaler.state_dict()
+    if train_state is not None:
+        payload["train_state"] = train_state
+    torch.save(payload, target)
 
 
 def _load_model_state(
@@ -589,6 +689,47 @@ def _resolve_train_val_records(
     )
 
 
+def _load_history_if_exists(path: str | Path, logger) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    source = Path(path)
+    if not source.exists():
+        return [], [], []
+    payload = read_json(source)
+    if not isinstance(payload, dict):
+        logger(f"[resume] ignore invalid history file format: {source}")
+        return [], [], []
+    epoch_history = payload.get("epoch_history", [])
+    print_history = payload.get("print_history", [])
+    eval_history = payload.get("eval_history", [])
+    if not isinstance(epoch_history, list) or not isinstance(print_history, list) or not isinstance(eval_history, list):
+        logger(f"[resume] ignore invalid history list fields: {source}")
+        return [], [], []
+    logger(
+        "[resume] loaded history from previous run: "
+        f"epochs={len(epoch_history)} prints={len(print_history)} evals={len(eval_history)}"
+    )
+    return epoch_history, print_history, eval_history
+
+
+def _restore_train_state_from_checkpoint(
+    checkpoint: dict[str, Any],
+) -> dict[str, Any]:
+    train_state = checkpoint.get("train_state")
+    if not isinstance(train_state, dict):
+        train_state = {}
+    restored = {
+        "epoch": int(train_state.get("epoch", checkpoint.get("epoch", 0))),
+        "global_step": int(train_state.get("global_step", checkpoint.get("global_step", 0))),
+        "best_val_auprc": float(train_state.get("best_val_auprc", checkpoint.get("best_val_auprc", -1.0))),
+        "best_threshold": float(train_state.get("best_threshold", checkpoint.get("threshold", 0.5))),
+        "best_epoch": int(train_state.get("best_epoch", -1)),
+        "best_step": int(train_state.get("best_step", -1)),
+        "evals_without_improve": int(train_state.get("evals_without_improve", 0)),
+        "best_val_metrics": train_state.get("best_val_metrics", {}),
+        "last_eval_metrics": train_state.get("last_eval_metrics", {}),
+    }
+    return restored
+
+
 def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> torch.Tensor:
     max_len = max(residue_lengths)
     labels_tensor = torch.full((len(label_strings), max_len), -100.0, dtype=torch.float32)
@@ -856,20 +997,40 @@ def _compute_pos_weight(records: list[ProteinRecord]) -> tuple[float, dict[str, 
     return (neg / pos), {"positive": pos, "negative": neg, "total": pos + neg}
 
 
-def train(config_path: str | Path) -> dict[str, Any]:
+def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) -> dict[str, Any]:
     config = load_config(config_path)
     set_seed(int(config["seed"]))
     stage = str(config.get("stage", "stage1"))
+    classifier_head_cfg = dict(config.get("classifier_head", {}))
     contrastive_cfg = dict(config.get("contrastive", {}))
     contrastive_enabled = bool(contrastive_cfg.get("enabled", False))
     contrastive_weight = float(contrastive_cfg.get("weight", 0.0)) if contrastive_enabled else 0.0
     contrastive_temperature = float(contrastive_cfg.get("temperature", 0.1))
     contrastive_max_samples = int(contrastive_cfg.get("max_samples_per_class", 256))
+    resume_checkpoint_cfg = _optional_str(config.get("resume_checkpoint"))
+    resume_checkpoint_cli = _optional_str(resume_checkpoint)
+    resume_checkpoint_value = resume_checkpoint_cli or resume_checkpoint_cfg
+    resumed = False
+    resume_checkpoint_path: Path | None = None
+    resume_checkpoint_payload: dict[str, Any] | None = None
+    resume_start_epoch = 0
+    resume_start_global_step = 0
 
     device = torch.device(config["device"])
     use_amp = device.type == "cuda"
-    output_base_dir = Path(config["output_dir"])
-    output_dir, run_id = _resolve_experiment_dir(output_base_dir, prefix=str(config["experiment_prefix"]))
+    if resume_checkpoint_value:
+        resume_checkpoint_path = Path(resume_checkpoint_value)
+        if not resume_checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_checkpoint_path}")
+        resume_checkpoint_payload = torch.load(resume_checkpoint_path, map_location="cpu")
+        output_dir = _infer_experiment_dir_from_checkpoint(resume_checkpoint_path)
+        run_id = output_dir.name
+        output_base_dir = output_dir.parent
+        resumed = True
+    else:
+        output_base_dir = Path(config["output_dir"])
+        output_dir, run_id = _resolve_experiment_dir(output_base_dir, prefix=str(config["experiment_prefix"]))
+
     metrics_dir = output_dir / "metrics"
     ckpt_dir = output_dir / "checkpoints"
     logs_dir = output_dir / "logs"
@@ -883,13 +1044,23 @@ def train(config_path: str | Path) -> dict[str, Any]:
     config_resolved["output_dir"] = str(output_dir)
     config_resolved["run_id"] = run_id
     config_resolved["output_base_dir"] = str(output_base_dir)
+    config_resolved["resume_checkpoint"] = str(resume_checkpoint_path) if resume_checkpoint_path else None
+    config_resolved["resumed"] = resumed
 
     log = _build_logger(logs_dir / "train.log")
-    log(f"Run started: run_id={run_id} output_dir={output_dir}")
+    if resumed:
+        log(
+            f"Run resumed: run_id={run_id} output_dir={output_dir} "
+            f"resume_checkpoint={resume_checkpoint_path}"
+        )
+    else:
+        log(f"Run started: run_id={run_id} output_dir={output_dir}")
     log(
         f"Run stage={stage} contrastive_enabled={contrastive_enabled} "
         f"contrastive_weight={contrastive_weight:.4f}"
     )
+    if bool(config.get("stage3_contrastive_forced_off", False)):
+        log("[stage3] contrastive.enabled=true ignored; forced to false for stage3.")
     tensorboard_info = _start_tensorboard_if_needed(
         enabled=bool(config.get("auto_start_tensorboard", True)),
         logdir=output_base_dir,
@@ -904,6 +1075,8 @@ def train(config_path: str | Path) -> dict[str, Any]:
     writer.add_text("run/stage", stage, 0)
     writer.add_text("run/config_path", str(Path(config_path)), 0)
     writer.add_text("run/config_resolved", json.dumps(config_resolved, ensure_ascii=False, indent=2), 0)
+    if resumed and resume_checkpoint_path is not None:
+        writer.add_text("run/resume_checkpoint", str(resume_checkpoint_path), 0)
     writer.add_text("tensorboard/service", json.dumps(tensorboard_info, ensure_ascii=False, indent=2), 0)
     wandb_run, wandb_info = _start_wandb_if_needed(
         enabled=bool(config.get("use_wandb", False)),
@@ -963,6 +1136,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
         dropout=float(config["dropout"]),
         freeze_backbone=bool(config["freeze_backbone"]),
         projection_dim=int(contrastive_cfg["proj_dim"]),
+        classifier_head=classifier_head_cfg,
     ).to(device)
 
     batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
@@ -992,10 +1166,70 @@ def train(config_path: str | Path) -> dict[str, Any]:
     scaler = _build_grad_scaler(enabled=use_amp)
     pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction="none")
-    writer.add_scalar("data/class_positive", class_stats["positive"], 0)
-    writer.add_scalar("data/class_negative", class_stats["negative"], 0)
-    writer.add_scalar("train/pos_weight", pos_weight, 0)
-    writer.add_scalar("train/contrastive_weight", contrastive_weight, 0)
+    best_auprc = -1.0
+    best_epoch = -1
+    best_step = -1
+    best_threshold = 0.5
+    evals_without_improve = 0
+    best_val_metrics: dict[str, Any] = {}
+    last_eval_metrics: dict[str, Any] = {}
+    global_step = 0
+    start_epoch = 0
+
+    if resumed:
+        history, print_history, eval_history = _load_history_if_exists(metrics_dir / "train_history.json", logger=log)
+    else:
+        history = []
+        print_history = []
+        eval_history = []
+
+    if resumed:
+        if resume_checkpoint_payload is None or resume_checkpoint_path is None:
+            raise RuntimeError("Internal error: resumed=True but resume checkpoint payload/path missing.")
+        _load_model_state(model, resume_checkpoint_payload["model_state"], logger=log)
+        if "optimizer_state" in resume_checkpoint_payload:
+            optimizer.load_state_dict(resume_checkpoint_payload["optimizer_state"])
+            log("[resume] optimizer state restored.")
+        else:
+            log("[resume] optimizer_state missing in checkpoint; optimizer reset.")
+        if "scaler_state" in resume_checkpoint_payload:
+            try:
+                scaler.load_state_dict(resume_checkpoint_payload["scaler_state"])
+                log("[resume] scaler state restored.")
+            except Exception as exc:
+                log(f"[resume] failed to restore scaler_state; scaler reset. error={exc}")
+        else:
+            log("[resume] scaler_state missing in checkpoint; scaler reset.")
+
+        restored_state = _restore_train_state_from_checkpoint(resume_checkpoint_payload)
+        start_epoch = max(0, restored_state["epoch"])
+        global_step = max(0, restored_state["global_step"])
+        best_auprc = restored_state["best_val_auprc"]
+        best_threshold = restored_state["best_threshold"]
+        best_epoch = restored_state["best_epoch"]
+        best_step = restored_state["best_step"]
+        evals_without_improve = max(0, restored_state["evals_without_improve"])
+        if isinstance(restored_state["best_val_metrics"], dict):
+            best_val_metrics = restored_state["best_val_metrics"]
+        if isinstance(restored_state["last_eval_metrics"], dict):
+            last_eval_metrics = restored_state["last_eval_metrics"]
+        resume_start_epoch = start_epoch
+        resume_start_global_step = global_step
+        if int(config["max_epochs"]) <= start_epoch:
+            raise ValueError(
+                f"resume checkpoint already at epoch={start_epoch}, "
+                f"but max_epochs={config['max_epochs']}. Increase max_epochs to continue training."
+            )
+        log(
+            "[resume] training state restored: "
+            f"start_epoch={start_epoch} global_step={global_step} "
+            f"best_val_auprc={best_auprc:.6f} best_threshold={best_threshold:.4f}"
+        )
+
+    writer.add_scalar("data/class_positive", class_stats["positive"], global_step)
+    writer.add_scalar("data/class_negative", class_stats["negative"], global_step)
+    writer.add_scalar("train/pos_weight", pos_weight, global_step)
+    writer.add_scalar("train/contrastive_weight", contrastive_weight, global_step)
     _wandb_log(
         wandb_run,
         {
@@ -1005,26 +1239,29 @@ def train(config_path: str | Path) -> dict[str, Any]:
             "train/contrastive_weight": contrastive_weight,
             "run/stage": stage,
         },
-        step=0,
+        step=global_step,
     )
-
-    best_auprc = -1.0
-    best_epoch = -1
-    best_step = -1
-    best_threshold = 0.5
-    evals_without_improve = 0
-    history: list[dict[str, Any]] = []
-    print_history: list[dict[str, Any]] = []
-    eval_history: list[dict[str, Any]] = []
-    best_val_metrics: dict[str, Any] = {}
-    last_eval_metrics: dict[str, Any] = {}
-    global_step = 0
 
     save_every = int(config["save_every"])
     print_every = int(config["print_every"])
     eval_every = int(config["eval_every"])
     early_stop_patience = int(config["early_stop_patience"])
     stop_training = False
+
+    def _current_train_state(epoch: int) -> dict[str, Any]:
+        return {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_auprc": best_auprc,
+            "best_threshold": best_threshold,
+            "best_epoch": best_epoch,
+            "best_step": best_step,
+            "evals_without_improve": evals_without_improve,
+            "best_val_metrics": best_val_metrics,
+            "last_eval_metrics": last_eval_metrics,
+            "resumed": resumed,
+            "resume_checkpoint": str(resume_checkpoint_path) if resume_checkpoint_path else None,
+        }
 
     def _run_validation(epoch: int, step: int, reason: str) -> None:
         nonlocal best_auprc, best_epoch, best_step, best_threshold
@@ -1093,6 +1330,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
                 best_val_auprc=best_auprc,
                 threshold=best_threshold,
                 config=config_resolved,
+                optimizer=optimizer,
+                scaler=scaler,
+                train_state=_current_train_state(epoch),
             )
             log(f"[best] updated best checkpoint at epoch={epoch}, step={step}, auprc={best_auprc:.6f}")
         else:
@@ -1100,7 +1340,7 @@ def train(config_path: str | Path) -> dict[str, Any]:
             log(f"[early-stop] no improvement count={evals_without_improve}/{early_stop_patience}")
 
     try:
-        for epoch in range(1, int(config["max_epochs"]) + 1):
+        for epoch in range(start_epoch + 1, int(config["max_epochs"]) + 1):
             model.train()
             start_time = time.time()
             running_total_loss = 0.0
@@ -1221,6 +1461,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
                         best_val_auprc=best_auprc,
                         threshold=best_threshold,
                         config=config_resolved,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        train_state=_current_train_state(epoch),
                     )
                     log(f"[save] periodic checkpoint saved: {checkpoint_path.name}")
 
@@ -1315,6 +1558,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
                     best_val_auprc=best_auprc,
                     threshold=best_threshold,
                     config=config_resolved,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    train_state=_current_train_state(history[-1]["epoch"] if history else start_epoch),
                 )
                 log(f"[save] final step checkpoint saved: {final_step_path.name}")
     finally:
@@ -1331,6 +1577,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
             best_val_auprc=0.0,
             threshold=best_threshold,
             config=config_resolved,
+            optimizer=optimizer,
+            scaler=scaler,
+            train_state=_current_train_state(history[-1]["epoch"] if history else start_epoch),
         )
         log("[best] best checkpoint was missing; fallback best.pt created from latest model state.")
 
@@ -1343,6 +1592,9 @@ def train(config_path: str | Path) -> dict[str, Any]:
         best_val_auprc=best_auprc,
         threshold=best_threshold,
         config=config_resolved,
+        optimizer=optimizer,
+        scaler=scaler,
+        train_state=_current_train_state(history[-1]["epoch"] if history else start_epoch),
     )
     log(f"[save] last checkpoint saved: {last_ckpt_path.name}")
 
@@ -1424,6 +1676,10 @@ def train(config_path: str | Path) -> dict[str, Any]:
             "split_manifest": str(active_split_manifest_path),
             "split_manifest_resolution": split_manifest_resolution,
             "rebuilt_exclusion_report": str(rebuilt_exclusion_report_path) if rebuilt_exclusion_report_path else None,
+            "resumed": resumed,
+            "resume_checkpoint": str(resume_checkpoint_path) if resume_checkpoint_path else None,
+            "resume_start_epoch": resume_start_epoch,
+            "resume_start_global_step": resume_start_global_step,
             "train_records": len(train_records),
             "val_records": len(val_records),
             "caid_records": len(caid_records),
@@ -1453,6 +1709,10 @@ def train(config_path: str | Path) -> dict[str, Any]:
         "wandb_service": wandb_info,
         "split_manifest": str(active_split_manifest_path),
         "split_manifest_resolution": split_manifest_resolution,
+        "resumed": resumed,
+        "resume_checkpoint": str(resume_checkpoint_path) if resume_checkpoint_path else None,
+        "resume_start_epoch": resume_start_epoch,
+        "resume_start_global_step": resume_start_global_step,
         "log_file": str(logs_dir / "train.log"),
         "best_checkpoint": str(best_ckpt_path),
         "last_checkpoint": str(last_ckpt_path),
@@ -1535,6 +1795,8 @@ def evaluate(
             raise ValueError(f"split_key {split_key!r} not found in split manifest.")
         records = select_records(records, manifest[split_key])
 
+    classifier_head_cfg = _resolve_classifier_head_config(config)
+
     backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(config["backbone_name"])
     model = ResidueClassifier(
         backbone=backbone,
@@ -1542,6 +1804,7 @@ def evaluate(
         dropout=float(config.get("dropout", 0.1)),
         freeze_backbone=bool(config.get("freeze_backbone", True)),
         projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
+        classifier_head=classifier_head_cfg,
     )
     _load_model_state(model, checkpoint["model_state"], logger=log)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))

@@ -47,6 +47,33 @@
   - 评测目录：`artifacts/runs/.../expXXXX/evaluations/evalXXXX/`
   - `run_metadata.json` / `evaluation_metadata.json` 中包含 `wandb_service` 与运行信息
 
+## Stage 3: MLP / Transformer 分类头容量增强（不使用对比学习）
+* 目标：在 Stage1/Stage2 基本持平前提下，优先通过分类头容量提升 AUPRC。
+* 训练目标：`BCEWithLogitsLoss`（不引入 SupCon 项）
+* 主干策略：继续冻结 **ProstT5**，仅训练分类头。
+* 分类头结构（`classifier_head.type=mlp5 | mlp12 | transformer`）：
+  - 5 层全连接：`hidden -> 1024 -> 256 -> 128 -> 64 -> 1`
+  - 12 层全连接：`hidden -> 1024 -> 1024 -> 768 -> 768 -> 512 -> 512 -> 256 -> 256 -> 128 -> 128 -> 64 -> 1`
+  - Transformer 头：逐残基 TransformerEncoder（默认 `2` 层、`4` 头、`ffn_dim=2048`）后接线性输出
+  - 每个隐层后使用：`ReLU + LayerNorm + Dropout(0.3)`
+  - 输出层仅线性映射到单 logit
+* Stage3 约束：
+  - `stage: stage3` 时，pipeline 强制 `contrastive.enabled=false`
+  - 若配置误开 `contrastive.enabled=true`，会在日志写明被强制关闭
+* 配置入口：
+  - Stage 3 模板：`configs/stage3_prostt5_mlp5.yaml`
+  - Stage 3 (MLP12) 模板：`configs/stage3_prostt5_mlp12.yaml`
+  - Stage 3 (Transformer) 模板：`configs/stage3_prostt5_transformer.yaml`
+  - 关键字段：`stage`、`freeze_backbone`、`classifier_head.*`、`contrastive.enabled`
+* Stage3 小规模实验计划：
+  - `E0`：Stage1 线性头基线
+  - `E1`：Stage3 MLP5 + BCE（核心对照）
+  - `E2`：Stage3 MLP5 + BCE，`dropout={0.2,0.3,0.4}`
+  - `E3`：Stage3 MLP5 + BCE，`lr={3e-4,1e-4}`
+  - `E4`：Stage3 MLP12 + BCE（深层头对照）
+  - `E5`：Stage3 Transformer + BCE（注意力分类头对照）
+  - 选择标准：验证集 AUPRC 最高；若提升 `< 0.005`，下一步改用 class-balanced focal（仍不加对比学习）
+
 ## 数据清洗策略（当前口径）
 * 原始文件备份：`dataset/disprot_202312_linker_label_not_cleaned.fasta`
 * 清洗后训练文件：`dataset/disprot_202312_linker_label.fasta`

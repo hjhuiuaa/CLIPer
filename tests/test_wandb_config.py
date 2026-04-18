@@ -50,3 +50,91 @@ def test_load_config_requires_project_when_wandb_enabled(tmp_path: Path) -> None
 
     with pytest.raises(ValueError, match="wandb_project"):
         load_config(config_path)
+
+
+def test_load_config_accepts_stage3_mlp12_defaults(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp12"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_mlp12.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["stage"] == "stage3"
+    assert loaded["classifier_head"]["type"] == "mlp12"
+    assert len(loaded["classifier_head"]["hidden_dims"]) == 11
+
+
+def test_load_config_rejects_invalid_mlp12_hidden_dims_length(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp12", "hidden_dims": [128] * 10},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_mlp12_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mlp12"):
+        load_config(config_path)
+
+
+def test_load_config_accepts_stage3_transformer_defaults(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "transformer"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_transformer.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["stage"] == "stage3"
+    assert loaded["classifier_head"]["type"] == "transformer"
+    assert loaded["classifier_head"]["num_layers"] == 2
+    assert loaded["classifier_head"]["num_heads"] == 4
+    assert loaded["classifier_head"]["ffn_dim"] == 2048
+    assert loaded["classifier_head"]["use_positional_encoding"] is True
+
+
+def test_load_config_rejects_invalid_transformer_params(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "transformer", "num_layers": 0},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_transformer_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="num_layers"):
+        load_config(config_path)
+
+
+def test_stage3_forces_contrastive_disabled_even_if_enabled_in_config(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "transformer"},
+            "contrastive": {"enabled": True},
+        }
+    )
+    config_path = tmp_path / "config_stage3_force_off.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["contrastive"]["enabled"] is False
+    assert loaded["stage3_contrastive_forced_off"] is True

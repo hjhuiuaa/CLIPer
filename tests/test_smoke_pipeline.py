@@ -196,3 +196,266 @@ def test_stage2_train_from_scratch_smoke(tmp_path: Path) -> None:
     assert Path(eval_result["predictions_path"]).exists()
     assert Path(eval_result["metrics_path"]).exists()
     assert eval_result["wandb_service"]["status"] == "disabled"
+
+
+def test_stage3_train_eval_smoke_with_mlp5_head(tmp_path: Path) -> None:
+    train_fasta = tmp_path / "disprot.fasta"
+    train_fasta.write_text(
+        (
+            _make_record("M1", 60, 10, 8)
+            + _make_record("M2", 64, 20, 12)
+            + _make_record("M3", 72, 5, 10)
+            + _make_record("M4", 80, 40, 6)
+            + _make_record("M5", 70, 30, 5)
+            + _make_record("M6", 75, 45, 7)
+        ),
+        encoding="utf-8",
+    )
+
+    caid_fasta = tmp_path / "caid.fasta"
+    caid_fasta.write_text(_make_record("M6", 75, 45, 7) + _make_record("C1", 68, 22, 8), encoding="utf-8")
+
+    error_file = tmp_path / "error.txt"
+    error_file.write_text(">M5\n", encoding="utf-8")
+
+    split_out = tmp_path / "split.json"
+    exclusion_out = tmp_path / "exclude.json"
+    prepare_data(
+        fasta_path=train_fasta,
+        error_file=error_file,
+        caid_fasta=caid_fasta,
+        seed=42,
+        val_ratio=0.25,
+        split_out=split_out,
+        exclusion_out=exclusion_out,
+    )
+
+    config = {
+        "stage": "stage3",
+        "backbone_name": "dummy",
+        "window_size": 64,
+        "batch_tokens": 128,
+        "optimizer": "adamw",
+        "lr": 1e-3,
+        "weight_decay": 0.0,
+        "max_epochs": 2,
+        "early_stop_patience": 2,
+        "seed": 42,
+        "threshold_search": {"min": 0.1, "max": 0.9, "step": 0.1},
+        "classifier_head": {
+            "type": "mlp5",
+            "dropout": 0.25,
+            "use_layernorm": True,
+            "activation": "relu",
+            "hidden_dims": [128, 64, 32, 16],
+        },
+        "contrastive": {
+            "enabled": False,
+            "weight": 0.2,
+            "temperature": 0.1,
+            "proj_dim": 32,
+            "max_samples_per_class": 16,
+        },
+        "train_fasta": str(train_fasta),
+        "caid_fasta": str(caid_fasta),
+        "split_manifest": str(split_out),
+        "output_dir": str(tmp_path / "run_stage3"),
+        "device": "cpu",
+        "eval_stride": 32,
+        "top_k_heuristic": 2,
+        "save_every": 1,
+        "print_every": 1,
+        "eval_every": 2,
+        "auto_start_tensorboard": False,
+    }
+    config_path = tmp_path / "config_stage3.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    train_result = train(config_path)
+    checkpoint_path = Path(train_result["best_checkpoint"])
+    assert checkpoint_path.exists()
+    assert train_result["stage"] == "stage3"
+    assert train_result["contrastive"]["enabled"] is False
+
+    eval_result = evaluate(
+        checkpoint_path=checkpoint_path,
+        fasta_path=caid_fasta,
+    )
+    assert Path(eval_result["predictions_path"]).exists()
+    assert Path(eval_result["metrics_path"]).exists()
+
+
+def test_stage3_train_eval_smoke_with_mlp12_head(tmp_path: Path) -> None:
+    train_fasta = tmp_path / "disprot.fasta"
+    train_fasta.write_text(
+        (
+            _make_record("N1", 60, 10, 8)
+            + _make_record("N2", 64, 20, 12)
+            + _make_record("N3", 72, 5, 10)
+            + _make_record("N4", 80, 40, 6)
+            + _make_record("N5", 70, 30, 5)
+            + _make_record("N6", 75, 45, 7)
+        ),
+        encoding="utf-8",
+    )
+
+    caid_fasta = tmp_path / "caid.fasta"
+    caid_fasta.write_text(_make_record("N6", 75, 45, 7) + _make_record("C1", 68, 22, 8), encoding="utf-8")
+
+    error_file = tmp_path / "error.txt"
+    error_file.write_text(">N5\n", encoding="utf-8")
+
+    split_out = tmp_path / "split.json"
+    exclusion_out = tmp_path / "exclude.json"
+    prepare_data(
+        fasta_path=train_fasta,
+        error_file=error_file,
+        caid_fasta=caid_fasta,
+        seed=42,
+        val_ratio=0.25,
+        split_out=split_out,
+        exclusion_out=exclusion_out,
+    )
+
+    config = {
+        "stage": "stage3",
+        "backbone_name": "dummy",
+        "window_size": 64,
+        "batch_tokens": 128,
+        "optimizer": "adamw",
+        "lr": 1e-3,
+        "weight_decay": 0.0,
+        "max_epochs": 2,
+        "early_stop_patience": 2,
+        "seed": 42,
+        "threshold_search": {"min": 0.1, "max": 0.9, "step": 0.1},
+        "classifier_head": {
+            "type": "mlp12",
+            "dropout": 0.2,
+            "use_layernorm": True,
+            "activation": "relu",
+            "hidden_dims": [128, 128, 96, 96, 64, 64, 48, 48, 32, 24, 16],
+        },
+        "contrastive": {
+            "enabled": False,
+            "weight": 0.2,
+            "temperature": 0.1,
+            "proj_dim": 32,
+            "max_samples_per_class": 16,
+        },
+        "train_fasta": str(train_fasta),
+        "caid_fasta": str(caid_fasta),
+        "split_manifest": str(split_out),
+        "output_dir": str(tmp_path / "run_stage3_mlp12"),
+        "device": "cpu",
+        "eval_stride": 32,
+        "top_k_heuristic": 2,
+        "save_every": 1,
+        "print_every": 1,
+        "eval_every": 2,
+        "auto_start_tensorboard": False,
+    }
+    config_path = tmp_path / "config_stage3_mlp12.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    train_result = train(config_path)
+    checkpoint_path = Path(train_result["best_checkpoint"])
+    assert checkpoint_path.exists()
+    assert train_result["stage"] == "stage3"
+    assert train_result["contrastive"]["enabled"] is False
+
+    eval_result = evaluate(
+        checkpoint_path=checkpoint_path,
+        fasta_path=caid_fasta,
+    )
+    assert Path(eval_result["predictions_path"]).exists()
+    assert Path(eval_result["metrics_path"]).exists()
+
+
+def test_stage3_train_eval_smoke_with_transformer_head(tmp_path: Path) -> None:
+    train_fasta = tmp_path / "disprot.fasta"
+    train_fasta.write_text(
+        (
+            _make_record("X1", 60, 10, 8)
+            + _make_record("X2", 64, 20, 12)
+            + _make_record("X3", 72, 5, 10)
+            + _make_record("X4", 80, 40, 6)
+            + _make_record("X5", 70, 30, 5)
+            + _make_record("X6", 75, 45, 7)
+        ),
+        encoding="utf-8",
+    )
+
+    caid_fasta = tmp_path / "caid.fasta"
+    caid_fasta.write_text(_make_record("X6", 75, 45, 7) + _make_record("C1", 68, 22, 8), encoding="utf-8")
+
+    error_file = tmp_path / "error.txt"
+    error_file.write_text(">X5\n", encoding="utf-8")
+
+    split_out = tmp_path / "split.json"
+    exclusion_out = tmp_path / "exclude.json"
+    prepare_data(
+        fasta_path=train_fasta,
+        error_file=error_file,
+        caid_fasta=caid_fasta,
+        seed=42,
+        val_ratio=0.25,
+        split_out=split_out,
+        exclusion_out=exclusion_out,
+    )
+
+    config = {
+        "stage": "stage3",
+        "backbone_name": "dummy",
+        "window_size": 64,
+        "batch_tokens": 128,
+        "optimizer": "adamw",
+        "lr": 1e-3,
+        "weight_decay": 0.0,
+        "max_epochs": 2,
+        "early_stop_patience": 2,
+        "seed": 42,
+        "threshold_search": {"min": 0.1, "max": 0.9, "step": 0.1},
+        "classifier_head": {
+            "type": "transformer",
+            "dropout": 0.2,
+            "activation": "relu",
+            "num_layers": 2,
+            "num_heads": 4,
+            "ffn_dim": 128,
+            "use_positional_encoding": True,
+        },
+        "contrastive": {
+            "enabled": False,
+            "weight": 0.2,
+            "temperature": 0.1,
+            "proj_dim": 32,
+            "max_samples_per_class": 16,
+        },
+        "train_fasta": str(train_fasta),
+        "caid_fasta": str(caid_fasta),
+        "split_manifest": str(split_out),
+        "output_dir": str(tmp_path / "run_stage3_transformer"),
+        "device": "cpu",
+        "eval_stride": 32,
+        "top_k_heuristic": 2,
+        "save_every": 1,
+        "print_every": 1,
+        "eval_every": 2,
+        "auto_start_tensorboard": False,
+    }
+    config_path = tmp_path / "config_stage3_transformer.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    train_result = train(config_path)
+    checkpoint_path = Path(train_result["best_checkpoint"])
+    assert checkpoint_path.exists()
+    assert train_result["stage"] == "stage3"
+    assert train_result["contrastive"]["enabled"] is False
+
+    eval_result = evaluate(
+        checkpoint_path=checkpoint_path,
+        fasta_path=caid_fasta,
+    )
+    assert Path(eval_result["predictions_path"]).exists()
+    assert Path(eval_result["metrics_path"]).exists()

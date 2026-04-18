@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -57,6 +58,123 @@ class DummyBackbone(nn.Module):
         return SimpleNamespace(last_hidden_state=outputs)
 
 
+def _build_activation(name: str) -> nn.Module:
+    key = name.lower()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "gelu":
+        return nn.GELU()
+    raise ValueError(f"Unsupported classifier_head activation: {name!r}")
+
+
+def _build_padding_mask(residue_lengths: list[int], max_len: int, *, device: torch.device) -> torch.Tensor:
+    if max_len <= 0:
+        raise ValueError(f"max_len must be > 0, got {max_len}")
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=device)
+    if lengths.numel() == 0:
+        raise ValueError("residue_lengths must not be empty.")
+    if int(lengths.min().item()) <= 0:
+        raise ValueError(f"residue_lengths must contain positive values, got {residue_lengths!r}")
+    if int(lengths.max().item()) > max_len:
+        raise ValueError(f"residue_lengths contains value > max_len: max_len={max_len}, lengths={residue_lengths!r}")
+    positions = torch.arange(max_len, device=device).unsqueeze(0).expand(lengths.shape[0], max_len)
+    return positions >= lengths.unsqueeze(1)
+
+
+def _sinusoidal_position_encoding(length: int, dim: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if length <= 0 or dim <= 0:
+        raise ValueError(f"length and dim must be > 0, got length={length}, dim={dim}")
+    positions = torch.arange(length, dtype=torch.float32, device=device).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / float(dim))
+    )
+    pe = torch.zeros(length, dim, dtype=torch.float32, device=device)
+    pe[:, 0::2] = torch.sin(positions * div_term)
+    cos_width = pe[:, 1::2].shape[1]
+    if cos_width > 0:
+        pe[:, 1::2] = torch.cos(positions * div_term[:cos_width])
+    return pe.to(dtype=dtype)
+
+
+class MLPClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        *,
+        dropout: float,
+        activation: str,
+        use_layernorm: bool,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = input_dim
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+class TransformerClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        num_layers: int,
+        num_heads: int,
+        ffn_dim: int,
+        dropout: float,
+        activation: str,
+        use_positional_encoding: bool,
+    ) -> None:
+        super().__init__()
+        activation_key = activation.lower()
+        if activation_key not in {"relu", "gelu"}:
+            raise ValueError(f"Unsupported classifier_head activation for transformer: {activation!r}")
+        if num_layers <= 0:
+            raise ValueError(f"classifier_head.num_layers must be > 0, got {num_layers}")
+        if num_heads <= 0:
+            raise ValueError(f"classifier_head.num_heads must be > 0, got {num_heads}")
+        if ffn_dim <= 0:
+            raise ValueError(f"classifier_head.ffn_dim must be > 0, got {ffn_dim}")
+        if input_dim % num_heads != 0:
+            raise ValueError(
+                "Transformer classifier_head requires hidden_size divisible by num_heads, "
+                f"got hidden_size={input_dim}, num_heads={num_heads}"
+            )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation=activation_key,
+            batch_first=True,
+        )
+        self.use_positional_encoding = bool(use_positional_encoding)
+        self.input_dropout = nn.Dropout(dropout)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.classifier = nn.Linear(input_dim, 1)
+
+    def forward(self, x: torch.Tensor, *, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_positional_encoding:
+            x = x + _sinusoidal_position_encoding(
+                length=x.shape[1],
+                dim=x.shape[2],
+                device=x.device,
+                dtype=x.dtype,
+            ).unsqueeze(0)
+        encoded = self.encoder(self.input_dropout(x), src_key_padding_mask=padding_mask)
+        return self.classifier(encoded)
+
+
 class ResidueClassifier(nn.Module):
     def __init__(
         self,
@@ -65,12 +183,53 @@ class ResidueClassifier(nn.Module):
         dropout: float = 0.1,
         freeze_backbone: bool = True,
         projection_dim: int = 128,
+        classifier_head: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
         self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(hidden_size, 1)
+
+        classifier_cfg = dict(classifier_head or {})
+        head_type = str(classifier_cfg.get("type", "linear")).lower()
+        self.classifier_type = head_type
+        if head_type == "linear":
+            self.classifier = nn.Linear(hidden_size, 1)
+        elif head_type in {"mlp5", "mlp12"}:
+            default_hidden_dims_map: dict[str, list[int]] = {
+                "mlp5": [1024, 256, 128, 64],
+                "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
+            }
+            expected_hidden_layers = 4 if head_type == "mlp5" else 11
+            hidden_dims_raw = classifier_cfg.get("hidden_dims", default_hidden_dims_map[head_type])
+            if not isinstance(hidden_dims_raw, list) or len(hidden_dims_raw) != expected_hidden_layers:
+                raise ValueError(
+                    f"classifier_head.hidden_dims for {head_type} must be a list of "
+                    f"{expected_hidden_layers} integers, got {hidden_dims_raw!r}"
+                )
+            hidden_dims = [int(dim) for dim in hidden_dims_raw]
+            if any(dim <= 0 for dim in hidden_dims):
+                raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims_raw!r}")
+            self.classifier = MLPClassifierHead(
+                input_dim=hidden_size,
+                hidden_dims=hidden_dims,
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_layernorm=bool(classifier_cfg.get("use_layernorm", True)),
+            )
+        elif head_type == "transformer":
+            self.classifier = TransformerClassifierHead(
+                input_dim=hidden_size,
+                num_layers=int(classifier_cfg.get("num_layers", 2)),
+                num_heads=int(classifier_cfg.get("num_heads", 4)),
+                ffn_dim=int(classifier_cfg.get("ffn_dim", 2048)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_positional_encoding=bool(classifier_cfg.get("use_positional_encoding", True)),
+            )
+        else:
+            raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
+
         self.projection_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
@@ -102,11 +261,15 @@ class ResidueClassifier(nn.Module):
                 f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
             )
         residue_hidden = hidden[:, :max_len, :]
-        projected_input = self.dropout(residue_hidden)
-        logits = self.classifier(projected_input).squeeze(-1)
+        classifier_input = self.dropout(residue_hidden)
+        if self.classifier_type == "transformer":
+            padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
+            logits = self.classifier(classifier_input, padding_mask=padding_mask).squeeze(-1)
+        else:
+            logits = self.classifier(classifier_input).squeeze(-1)
         if not return_embeddings:
             return logits
-        embeddings = self.projection_head(projected_input)
+        embeddings = self.projection_head(classifier_input)
         return logits, embeddings
 
 
