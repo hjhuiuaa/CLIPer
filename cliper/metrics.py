@@ -73,6 +73,32 @@ def mcc_score(y_true: Iterable[int], y_pred: Iterable[int]) -> float:
     return numerator / denominator
 
 
+def binary_roc_auc(y_true: list[int], y_prob: list[float]) -> float | None:
+    """Rank-based AUROC (Mann–Whitney U), matching eval_auc.py. Returns None if undefined."""
+    if not y_true:
+        return None
+    n_pos = sum(y_true)
+    n_neg = len(y_true) - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return None
+    pairs = sorted(zip(y_prob, y_true), key=lambda t: t[0])
+    n = len(pairs)
+    rank_sum_pos = 0.0
+    i = 0
+    rank = 1
+    while i < n:
+        j = i + 1
+        while j < n and pairs[j][0] == pairs[i][0]:
+            j += 1
+        avg_rank = (rank + (rank + (j - i) - 1)) / 2.0
+        pos_in_group = sum(label for _, label in pairs[i:j])
+        rank_sum_pos += avg_rank * pos_in_group
+        rank += j - i
+        i = j
+    u = rank_sum_pos - (n_pos * (n_pos + 1) / 2.0)
+    return u / (n_pos * n_neg)
+
+
 def apply_threshold(y_prob: Iterable[float], threshold: float) -> list[int]:
     return [1 if prob >= threshold else 0 for prob in y_prob]
 

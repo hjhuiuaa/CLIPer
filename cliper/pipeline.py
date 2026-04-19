@@ -29,7 +29,14 @@ from .data import (
     select_records,
     write_json,
 )
-from .metrics import apply_threshold, f1_score, mcc_score, precision_recall_auc, search_best_threshold
+from .metrics import (
+    apply_threshold,
+    binary_roc_auc,
+    f1_score,
+    mcc_score,
+    precision_recall_auc,
+    search_best_threshold,
+)
 from .modeling import ResidueClassifier, encode_sequences, load_backbone_and_tokenizer
 from .windowing import build_eval_window_starts, merge_window_logits, sigmoid, training_crop
 
@@ -958,6 +965,7 @@ def evaluate_records(
 
     preds = apply_threshold(y_prob_all, tuned_threshold) if y_true_all else []
     auprc = precision_recall_auc(y_true_all, y_prob_all) if y_true_all else 0.0
+    auroc = binary_roc_auc(y_true_all, y_prob_all)
     f1 = best_f1 if y_true_all and threshold is None else (f1_score(y_true_all, preds) if y_true_all else 0.0)
     mcc = best_mcc if y_true_all and threshold is None else (mcc_score(y_true_all, preds) if y_true_all else 0.0)
 
@@ -967,12 +975,19 @@ def evaluate_records(
             "num_records": len(records),
             "num_scored_residues": len(y_true_all),
             "auprc": auprc,
+            "auroc": auroc,
             "f1": f1,
             "mcc": mcc,
             "threshold": tuned_threshold,
         },
         "per_record": per_record,
     }
+
+
+def _format_auroc_for_log(auroc: float | None) -> str:
+    if auroc is None:
+        return "n/a"
+    return f"{float(auroc):.6f}"
 
 
 def _write_predictions_tsv(path: str | Path, per_record: list[tuple[str, str, list[float]]], threshold: float) -> None:
@@ -1267,6 +1282,22 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         nonlocal best_auprc, best_epoch, best_step, best_threshold
         nonlocal best_val_metrics, evals_without_improve, last_eval_metrics
 
+        train_result = evaluate_records(
+            model,
+            tokenizer,
+            config["backbone_name"],
+            train_records,
+            window_size=int(config["window_size"]),
+            stride=config["eval_stride"],
+            top_k_heuristic=int(config["top_k_heuristic"]),
+            device=device,
+            batch_size=batch_size,
+            threshold=None,
+            threshold_search=config["threshold_search"],
+            mixed_precision=use_amp,
+        )
+        train_metrics = train_result["metrics"]
+
         val_result = evaluate_records(
             model,
             tokenizer,
@@ -1289,29 +1320,39 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 "epoch": epoch,
                 "global_step": step,
                 "reason": reason,
+                "train_metrics": train_metrics,
                 "metrics": val_metrics,
                 "threshold": val_threshold,
             }
         )
 
+        writer.add_scalar("train/auprc", float(train_metrics["auprc"]), step)
+        if train_metrics.get("auroc") is not None:
+            writer.add_scalar("train/auroc", float(train_metrics["auroc"]), step)
         writer.add_scalar("val/auprc", float(val_metrics["auprc"]), step)
+        if val_metrics.get("auroc") is not None:
+            writer.add_scalar("val/auroc", float(val_metrics["auroc"]), step)
         writer.add_scalar("val/f1", float(val_metrics["f1"]), step)
         writer.add_scalar("val/mcc", float(val_metrics["mcc"]), step)
         writer.add_scalar("val/threshold", float(val_threshold), step)
-        _wandb_log(
-            wandb_run,
-            {
-                "val/auprc": float(val_metrics["auprc"]),
-                "val/f1": float(val_metrics["f1"]),
-                "val/mcc": float(val_metrics["mcc"]),
-                "val/threshold": float(val_threshold),
-            },
-            step=step,
-        )
+        wandb_eval_payload: dict[str, Any] = {
+            "train/auprc": float(train_metrics["auprc"]),
+            "val/auprc": float(val_metrics["auprc"]),
+            "val/f1": float(val_metrics["f1"]),
+            "val/mcc": float(val_metrics["mcc"]),
+            "val/threshold": float(val_threshold),
+        }
+        if train_metrics.get("auroc") is not None:
+            wandb_eval_payload["train/auroc"] = float(train_metrics["auroc"])
+        if val_metrics.get("auroc") is not None:
+            wandb_eval_payload["val/auroc"] = float(val_metrics["auroc"])
+        _wandb_log(wandb_run, wandb_eval_payload, step=step)
         log(
             "[eval] "
             f"reason={reason} epoch={epoch} step={step} "
-            f"auprc={val_metrics['auprc']:.6f} f1={val_metrics['f1']:.6f} mcc={val_metrics['mcc']:.6f} "
+            f"train_auprc={train_metrics['auprc']:.6f} train_auroc={_format_auroc_for_log(train_metrics.get('auroc'))} "
+            f"val_auprc={val_metrics['auprc']:.6f} val_auroc={_format_auroc_for_log(val_metrics.get('auroc'))} "
+            f"f1={val_metrics['f1']:.6f} mcc={val_metrics['mcc']:.6f} "
             f"threshold={val_threshold:.4f}"
         )
 
@@ -1620,6 +1661,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     log(
         "[caid3] "
         f"auprc={caid_eval['metrics']['auprc']:.6f} "
+        f"auroc={_format_auroc_for_log(caid_eval['metrics'].get('auroc'))} "
         f"f1={caid_eval['metrics']['f1']:.6f} "
         f"mcc={caid_eval['metrics']['mcc']:.6f} "
         f"threshold={caid_eval['metrics']['threshold']:.4f}"
@@ -1627,20 +1669,21 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
 
     writer = SummaryWriter(log_dir=str(tensorboard_dir))
     writer.add_scalar("caid3/auprc", float(caid_eval["metrics"]["auprc"]), global_step)
+    if caid_eval["metrics"].get("auroc") is not None:
+        writer.add_scalar("caid3/auroc", float(caid_eval["metrics"]["auroc"]), global_step)
     writer.add_scalar("caid3/f1", float(caid_eval["metrics"]["f1"]), global_step)
     writer.add_scalar("caid3/mcc", float(caid_eval["metrics"]["mcc"]), global_step)
     writer.flush()
     writer.close()
-    _wandb_log(
-        wandb_run,
-        {
-            "caid3/auprc": float(caid_eval["metrics"]["auprc"]),
-            "caid3/f1": float(caid_eval["metrics"]["f1"]),
-            "caid3/mcc": float(caid_eval["metrics"]["mcc"]),
-            "caid3/threshold": float(caid_eval["metrics"]["threshold"]),
-        },
-        step=global_step,
-    )
+    caid3_wandb: dict[str, Any] = {
+        "caid3/auprc": float(caid_eval["metrics"]["auprc"]),
+        "caid3/f1": float(caid_eval["metrics"]["f1"]),
+        "caid3/mcc": float(caid_eval["metrics"]["mcc"]),
+        "caid3/threshold": float(caid_eval["metrics"]["threshold"]),
+    }
+    if caid_eval["metrics"].get("auroc") is not None:
+        caid3_wandb["caid3/auroc"] = float(caid_eval["metrics"]["auroc"])
+    _wandb_log(wandb_run, caid3_wandb, step=global_step)
 
     write_json(
         metrics_dir / "train_history.json",
@@ -1825,17 +1868,17 @@ def evaluate(
         threshold_search=config["threshold_search"],
         mixed_precision=(device.type == "cuda"),
     )
-    _wandb_log(
-        wandb_run,
-        {
-            "eval/auprc": float(result["metrics"]["auprc"]),
-            "eval/f1": float(result["metrics"]["f1"]),
-            "eval/mcc": float(result["metrics"]["mcc"]),
-            "eval/threshold": float(result["metrics"]["threshold"]),
-            "eval/num_records": int(result["metrics"]["num_records"]),
-            "eval/num_scored_residues": int(result["metrics"]["num_scored_residues"]),
-        },
-    )
+    eval_wandb: dict[str, Any] = {
+        "eval/auprc": float(result["metrics"]["auprc"]),
+        "eval/f1": float(result["metrics"]["f1"]),
+        "eval/mcc": float(result["metrics"]["mcc"]),
+        "eval/threshold": float(result["metrics"]["threshold"]),
+        "eval/num_records": int(result["metrics"]["num_records"]),
+        "eval/num_scored_residues": int(result["metrics"]["num_scored_residues"]),
+    }
+    if result["metrics"].get("auroc") is not None:
+        eval_wandb["eval/auroc"] = float(result["metrics"]["auroc"])
+    _wandb_log(wandb_run, eval_wandb)
 
     predictions_path = output / "predictions.tsv"
     metrics_path = output / "metrics.json"
@@ -1861,6 +1904,7 @@ def evaluate(
         "[eval] "
         f"checkpoint={Path(checkpoint_path).name} output_dir={output} "
         f"auprc={result['metrics']['auprc']:.6f} "
+        f"auroc={_format_auroc_for_log(result['metrics'].get('auroc'))} "
         f"f1={result['metrics']['f1']:.6f} "
         f"mcc={result['metrics']['mcc']:.6f}"
     )
