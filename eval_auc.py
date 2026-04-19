@@ -179,9 +179,12 @@ def main() -> int:
 
     with pred_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        columns = reader.fieldnames or []
-        if not columns:
+        raw_fields = reader.fieldnames or []
+        if not raw_fields:
             raise ValueError("Predictions file has no header columns.")
+        rows = list(reader)
+        rows = [{k.lstrip("\ufeff").strip(): v for k, v in row.items()} for row in rows]
+        columns = list(rows[0].keys()) if rows else [h.lstrip("\ufeff").strip() for h in raw_fields]
 
         label_col = args.label_col or _first_existing(
             ("label", "y_true", "target", "gold", "residue_label", "true_label"), columns
@@ -197,7 +200,6 @@ def main() -> int:
 
         y_true: list[int] = []
         y_score: list[float] = []
-        rows = list(reader)
 
         if label_col is not None:
             for row in rows:
@@ -231,6 +233,7 @@ def main() -> int:
             skipped_masked = 0
             missing_pid = 0
             bad_pos = 0
+            missing_pid_samples: list[str] = []
             for row in rows:
                 pid = row[pid_col].strip()
                 score_raw = row[score_col].strip()
@@ -238,6 +241,8 @@ def main() -> int:
                 label_seq = labels_by_id.get(pid)
                 if label_seq is None:
                     missing_pid += 1
+                    if len(missing_pid_samples) < 5:
+                        missing_pid_samples.append(pid)
                     continue
                 try:
                     pos = int(float(pos_str))
@@ -258,9 +263,15 @@ def main() -> int:
                 used += 1
 
             if used == 0:
+                fasta_ids_sample = list(labels_by_id.keys())[:5]
                 raise ValueError(
                     "No aligned rows found between predictions and --fasta-labels. "
-                    "Check protein ids and position columns."
+                    f"tsv_rows={len(rows)} missing_pid={missing_pid} bad_pos={bad_pos} "
+                    f"skipped_masked={skipped_masked} "
+                    f"pid_col={pid_col!r} pos_col={pos_col!r} score_col={score_col!r}. "
+                    f"sample_prediction_pids={missing_pid_samples!r} "
+                    f"sample_fasta_pids={fasta_ids_sample!r}. "
+                    "If missing_pid is high, protein_id strings in TSV do not match FASTA headers (after '>')."
                 )
 
     auroc = _auc_roc(y_true, y_score)

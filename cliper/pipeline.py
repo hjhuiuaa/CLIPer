@@ -349,7 +349,7 @@ def _save_checkpoint(
     epoch: int,
     global_step: int,
     model: nn.Module,
-    best_val_auprc: float,
+    best_val_auroc: float,
     threshold: float,
     config: dict[str, Any],
     optimizer: AdamW | None = None,
@@ -362,7 +362,7 @@ def _save_checkpoint(
         "epoch": epoch,
         "global_step": global_step,
         "model_state": model.state_dict(),
-        "best_val_auprc": best_val_auprc,
+        "best_val_auroc": best_val_auroc,
         "threshold": threshold,
         "config": config,
     }
@@ -723,10 +723,17 @@ def _restore_train_state_from_checkpoint(
     train_state = checkpoint.get("train_state")
     if not isinstance(train_state, dict):
         train_state = {}
+    best_val_stored = train_state.get("best_val_auroc")
+    if best_val_stored is None:
+        best_val_stored = train_state.get("best_val_auprc")
+    if best_val_stored is None:
+        best_val_stored = checkpoint.get("best_val_auroc")
+    if best_val_stored is None:
+        best_val_stored = checkpoint.get("best_val_auprc", -1.0)
     restored = {
         "epoch": int(train_state.get("epoch", checkpoint.get("epoch", 0))),
         "global_step": int(train_state.get("global_step", checkpoint.get("global_step", 0))),
-        "best_val_auprc": float(train_state.get("best_val_auprc", checkpoint.get("best_val_auprc", -1.0))),
+        "best_val_auroc": float(best_val_stored),
         "best_threshold": float(train_state.get("best_threshold", checkpoint.get("threshold", 0.5))),
         "best_epoch": int(train_state.get("best_epoch", -1)),
         "best_step": int(train_state.get("best_step", -1)),
@@ -1181,7 +1188,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     scaler = _build_grad_scaler(enabled=use_amp)
     pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction="none")
-    best_auprc = -1.0
+    best_auroc = -1.0
     best_epoch = -1
     best_step = -1
     best_threshold = 0.5
@@ -1219,7 +1226,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         restored_state = _restore_train_state_from_checkpoint(resume_checkpoint_payload)
         start_epoch = max(0, restored_state["epoch"])
         global_step = max(0, restored_state["global_step"])
-        best_auprc = restored_state["best_val_auprc"]
+        best_auroc = restored_state["best_val_auroc"]
         best_threshold = restored_state["best_threshold"]
         best_epoch = restored_state["best_epoch"]
         best_step = restored_state["best_step"]
@@ -1238,7 +1245,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         log(
             "[resume] training state restored: "
             f"start_epoch={start_epoch} global_step={global_step} "
-            f"best_val_auprc={best_auprc:.6f} best_threshold={best_threshold:.4f}"
+            f"best_val_auroc={best_auroc:.6f} best_threshold={best_threshold:.4f}"
         )
 
     writer.add_scalar("data/class_positive", class_stats["positive"], global_step)
@@ -1267,7 +1274,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         return {
             "epoch": epoch,
             "global_step": global_step,
-            "best_val_auprc": best_auprc,
+            "best_val_auroc": best_auroc,
             "best_threshold": best_threshold,
             "best_epoch": best_epoch,
             "best_step": best_step,
@@ -1279,7 +1286,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         }
 
     def _run_validation(epoch: int, step: int, reason: str) -> None:
-        nonlocal best_auprc, best_epoch, best_step, best_threshold
+        nonlocal best_auroc, best_epoch, best_step, best_threshold
         nonlocal best_val_metrics, evals_without_improve, last_eval_metrics
 
         train_result = evaluate_records(
@@ -1356,8 +1363,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             f"threshold={val_threshold:.4f}"
         )
 
-        if float(val_metrics["auprc"]) > best_auprc:
-            best_auprc = float(val_metrics["auprc"])
+        val_auroc = val_metrics.get("auroc")
+        if val_auroc is not None and float(val_auroc) > best_auroc:
+            best_auroc = float(val_auroc)
             best_epoch = epoch
             best_step = step
             best_threshold = val_threshold
@@ -1368,14 +1376,14 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 epoch=epoch,
                 global_step=step,
                 model=model,
-                best_val_auprc=best_auprc,
+                best_val_auroc=best_auroc,
                 threshold=best_threshold,
                 config=config_resolved,
                 optimizer=optimizer,
                 scaler=scaler,
                 train_state=_current_train_state(epoch),
             )
-            log(f"[best] updated best checkpoint at epoch={epoch}, step={step}, auprc={best_auprc:.6f}")
+            log(f"[best] updated best checkpoint at epoch={epoch}, step={step}, val_auroc={best_auroc:.6f}")
         else:
             evals_without_improve += 1
             log(f"[early-stop] no improvement count={evals_without_improve}/{early_stop_patience}")
@@ -1499,7 +1507,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                         epoch=epoch,
                         global_step=global_step,
                         model=model,
-                        best_val_auprc=best_auprc,
+                        best_val_auroc=best_auroc,
                         threshold=best_threshold,
                         config=config_resolved,
                         optimizer=optimizer,
@@ -1596,7 +1604,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                     epoch=history[-1]["epoch"] if history else 0,
                     global_step=global_step,
                     model=model,
-                    best_val_auprc=best_auprc,
+                    best_val_auroc=best_auroc,
                     threshold=best_threshold,
                     config=config_resolved,
                     optimizer=optimizer,
@@ -1615,7 +1623,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             epoch=history[-1]["epoch"] if history else 0,
             global_step=global_step,
             model=model,
-            best_val_auprc=0.0,
+            best_val_auroc=0.0,
             threshold=best_threshold,
             config=config_resolved,
             optimizer=optimizer,
@@ -1630,7 +1638,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         epoch=history[-1]["epoch"] if history else 0,
         global_step=global_step,
         model=model,
-        best_val_auprc=best_auprc,
+        best_val_auroc=best_auroc,
         threshold=best_threshold,
         config=config_resolved,
         optimizer=optimizer,
@@ -1762,7 +1770,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         "best_epoch": best_epoch,
         "best_step": best_step,
         "global_steps": global_step,
-        "best_val_auprc": best_auprc,
+        "best_val_auroc": best_auroc,
         "stage": stage,
         "contrastive": contrastive_cfg,
         "caid3_metrics": caid_eval["metrics"],
