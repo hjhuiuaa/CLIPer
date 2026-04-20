@@ -22,3 +22,7 @@ artifacts/
 # local export / sync bundles (large; do not commit)
 *.tar
 *.tar.gz
+
+# disorder: user-provided FASTA in package dir (keep __init__.py)
+disorder/data/*
+!disorder/data/__init__.py

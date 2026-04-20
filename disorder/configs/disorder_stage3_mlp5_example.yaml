@@ -1,0 +1,61 @@
+# Disorder + Stage3 (MLP5 head). Same training loop as CLIPer stage3; only data windowing differs (overlap / split penalty).
+# Copy and set paths on your server.
+
+stage: stage3
+backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
+window_size: 1024
+window_overlap: 256
+eval_window_overlap: 256
+train_split_penalty_weight: 3.0
+
+batch_tokens: 2048
+optimizer: adamw
+lr: 0.0003
+weight_decay: 0.01
+max_epochs: 30
+early_stop_patience: 5
+seed: 42
+threshold_search:
+  min: 0.05
+  max: 0.95
+  step: 0.05
+
+dropout: 0.1
+freeze_backbone: true
+eval_stride: 512
+top_k_heuristic: 4
+num_workers: 0
+device: cuda
+
+classifier_head:
+  type: mlp5
+  dropout: 0.3
+  use_layernorm: true
+  activation: relu
+  hidden_dims: [1024, 256, 128, 64]
+
+contrastive:
+  enabled: false
+  weight: 0.2
+  temperature: 0.1
+  proj_dim: 128
+  max_samples_per_class: 256
+
+train_fasta: /data/huggs/hujh/disorder/disprot_train_label.fasta
+caid_fasta: /data/huggs/hujh/disorder/disprot_holdout.fasta
+split_manifest: disorder/artifacts/splits/disorder_split_seed42.json
+output_dir: disorder/artifacts/runs/disorder_stage3_mlp5
+experiment_prefix: exp
+save_every: 500
+print_every: 20
+eval_every: 200
+auto_start_tensorboard: true
+tensorboard_host: 0.0.0.0
+tensorboard_port: 6006
+use_wandb: false
+wandb_entity: 3151599052-nankai-university
+wandb_project: CLIPer
+wandb_mode: online
+wandb_run_name: null
+wandb_group: disorder_stage3_mlp5
+wandb_tags: [disorder, stage3, bce, mlp5]

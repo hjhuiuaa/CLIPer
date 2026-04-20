@@ -1,0 +1,46 @@
+# Train disorder head on precomputed ProstT5 embeddings (disorder-only workflow).
+# 1) extract_features on train.fasta, val.fasta, test.fasta (2-line each) into the same or split dirs.
+# 2) train_features with paired label FASTA (3-line) paths below.
+# 3) eval_features with test.fasta + test_label.fasta.
+
+# Place the six split FASTA files under disorder/data/ on the server.
+features_dir: /data/huggs/hujh/CLIPer/disorder/prostt5_features
+train_sequence_fasta: /data/huggs/hujh/CLIPer/disorder/data/train.fasta
+train_label_fasta: /data/huggs/hujh/CLIPer/disorder/data/train_rmSimi_label.fasta
+val_sequence_fasta: /data/huggs/hujh/CLIPer/disorder/data/val.fasta
+val_label_fasta: /data/huggs/hujh/CLIPer/disorder/data/val_rmSimi_label.fasta
+
+window_size: 1024
+window_overlap: 256
+eval_window_overlap: 256
+train_split_penalty_weight: 3.0
+
+# Must match manifest.json hidden_size from extract_features (infer if omitted).
+# hidden_size: 1024
+
+classifier_head:
+  type: mlp5
+  dropout: 0.3
+  use_layernorm: true
+  activation: relu
+  hidden_dims: [1024, 256, 128, 64]
+
+dropout: 0.1
+seed: 42
+max_epochs: 30
+early_stop_patience: 5
+lr: 0.0003
+weight_decay: 0.01
+batch_size: 4
+eval_window_batch_size: 8
+eval_every: 200
+print_every: 20
+save_every: 500
+num_workers: 0
+device: cuda
+mixed_precision: true
+output_dir: disorder/artifacts/runs/disorder_feature_stage3_mlp5
+threshold_search:
+  min: 0.05
+  max: 0.95
+  step: 0.05

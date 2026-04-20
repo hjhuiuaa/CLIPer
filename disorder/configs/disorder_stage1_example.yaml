@@ -1,0 +1,49 @@
+# Example: stage1-style linear head. For stage3 + mlp5 use disorder_stage3_mlp5_example.yaml.
+# Copy and set train_fasta / caid_fasta / split paths on your server.
+# Disorder-specific: overlapping windows for L>window_size (training crop grid + eval sliding merge).
+
+backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
+window_size: 1024
+# Overlap between adjacent windows (train grid stride = window_size - window_overlap; eval uses same unless overridden).
+window_overlap: 256
+eval_window_overlap: 256
+# Higher = stronger penalty for cutting through a contiguous positive (disorder) run when picking a train crop.
+train_split_penalty_weight: 3.0
+
+batch_tokens: 2048
+optimizer: adamw
+lr: 0.0003
+weight_decay: 0.01
+max_epochs: 30
+early_stop_patience: 5
+seed: 42
+threshold_search:
+  min: 0.05
+  max: 0.95
+  step: 0.05
+
+dropout: 0.1
+freeze_backbone: true
+eval_stride: 512
+top_k_heuristic: 4
+num_workers: 0
+device: cuda
+
+train_fasta: /data/huggs/hujh/disorder/disprot_train_label.fasta
+caid_fasta: /data/huggs/hujh/disorder/disprot_holdout.fasta
+split_manifest: disorder/artifacts/splits/disorder_split_seed42.json
+output_dir: disorder/artifacts/runs/disorder_stage1
+experiment_prefix: exp
+save_every: 500
+print_every: 20
+eval_every: 200
+auto_start_tensorboard: true
+tensorboard_host: 0.0.0.0
+tensorboard_port: 6006
+use_wandb: false
+wandb_entity: 3151599052-nankai-university
+wandb_project: CLIPer
+wandb_mode: online
+wandb_run_name: null
+wandb_group: disorder_stage1
+wandb_tags: [disorder, bce]
