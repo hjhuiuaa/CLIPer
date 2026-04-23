@@ -103,18 +103,31 @@ class MLPClassifierHead(nn.Module):
         hidden_dims: list[int],
         *,
         dropout: float,
+        dropout_schedule: list[float] | None = None,
         activation: str,
         use_layernorm: bool,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
         in_dim = input_dim
-        for hidden_dim in hidden_dims:
+        if dropout_schedule is None:
+            per_layer_dropout = [float(dropout)] * len(hidden_dims)
+        else:
+            if len(dropout_schedule) != len(hidden_dims):
+                raise ValueError(
+                    "classifier_head.dropout_schedule length must match hidden_dims length: "
+                    f"{len(dropout_schedule)} vs {len(hidden_dims)}"
+                )
+            per_layer_dropout = [float(x) for x in dropout_schedule]
+            for value in per_layer_dropout:
+                if not (0.0 <= value < 1.0):
+                    raise ValueError(f"classifier_head.dropout_schedule values must be in [0,1), got {value}")
+        for hidden_order, hidden_dim in enumerate(hidden_dims):
             layers.append(nn.Linear(in_dim, hidden_dim))
             if use_layernorm:
                 layers.append(nn.LayerNorm(hidden_dim))
             layers.append(_build_activation(activation))
-            layers.append(nn.Dropout(dropout))
+            layers.append(nn.Dropout(per_layer_dropout[hidden_order]))
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, 1))
         self.network = nn.Sequential(*layers)
@@ -195,12 +208,13 @@ class ResidueClassifier(nn.Module):
         self.classifier_type = head_type
         if head_type == "linear":
             self.classifier = nn.Linear(hidden_size, 1)
-        elif head_type in {"mlp5", "mlp12"}:
+        elif head_type in {"mlp3", "mlp5", "mlp12"}:
             default_hidden_dims_map: dict[str, list[int]] = {
+                "mlp3": [128, 64, 32],
                 "mlp5": [1024, 256, 128, 64],
                 "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
             }
-            expected_hidden_layers = 4 if head_type == "mlp5" else 11
+            expected_hidden_layers = {"mlp3": 3, "mlp5": 4, "mlp12": 11}[head_type]
             hidden_dims_raw = classifier_cfg.get("hidden_dims", default_hidden_dims_map[head_type])
             if not isinstance(hidden_dims_raw, list) or len(hidden_dims_raw) != expected_hidden_layers:
                 raise ValueError(
@@ -210,10 +224,20 @@ class ResidueClassifier(nn.Module):
             hidden_dims = [int(dim) for dim in hidden_dims_raw]
             if any(dim <= 0 for dim in hidden_dims):
                 raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims_raw!r}")
+            if head_type == "mlp3" and any(dim > 128 for dim in hidden_dims):
+                raise ValueError(
+                    "classifier_head.hidden_dims for mlp3 must use widths <= 128, "
+                    f"got {hidden_dims_raw!r}"
+                )
             self.classifier = MLPClassifierHead(
                 input_dim=hidden_size,
                 hidden_dims=hidden_dims,
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
+                dropout_schedule=(
+                    [float(x) for x in classifier_cfg["dropout_schedule"]]
+                    if isinstance(classifier_cfg.get("dropout_schedule"), list)
+                    else None
+                ),
                 activation=str(classifier_cfg.get("activation", "relu")),
                 use_layernorm=bool(classifier_cfg.get("use_layernorm", True)),
             )

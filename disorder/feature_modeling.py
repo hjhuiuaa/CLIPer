@@ -26,12 +26,13 @@ class DisorderFeatureClassifier(nn.Module):
         self.classifier_type = head_type
         if head_type == "linear":
             self.classifier = nn.Linear(hidden_size, 1)
-        elif head_type in {"mlp5", "mlp12"}:
+        elif head_type in {"mlp3", "mlp5", "mlp12"}:
             default_hidden_dims_map: dict[str, list[int]] = {
+                "mlp3": [128, 64, 32],
                 "mlp5": [1024, 256, 128, 64],
                 "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
             }
-            expected_hidden_layers = 4 if head_type == "mlp5" else 11
+            expected_hidden_layers = {"mlp3": 3, "mlp5": 4, "mlp12": 11}[head_type]
             hidden_dims_raw = classifier_cfg.get("hidden_dims", default_hidden_dims_map[head_type])
             if not isinstance(hidden_dims_raw, list) or len(hidden_dims_raw) != expected_hidden_layers:
                 raise ValueError(
@@ -41,10 +42,20 @@ class DisorderFeatureClassifier(nn.Module):
             hidden_dims = [int(dim) for dim in hidden_dims_raw]
             if any(dim <= 0 for dim in hidden_dims):
                 raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims_raw!r}")
+            if head_type == "mlp3" and any(dim > 128 for dim in hidden_dims):
+                raise ValueError(
+                    "classifier_head.hidden_dims for mlp3 must use widths <= 128, "
+                    f"got {hidden_dims_raw!r}"
+                )
             self.classifier = MLPClassifierHead(
                 input_dim=hidden_size,
                 hidden_dims=hidden_dims,
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
+                dropout_schedule=(
+                    [float(x) for x in classifier_cfg["dropout_schedule"]]
+                    if isinstance(classifier_cfg.get("dropout_schedule"), list)
+                    else None
+                ),
                 activation=str(classifier_cfg.get("activation", "relu")),
                 use_layernorm=bool(classifier_cfg.get("use_layernorm", True)),
             )

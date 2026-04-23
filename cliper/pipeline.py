@@ -186,9 +186,9 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
     defaults.update(provided)
 
     head_type = str(defaults.get("type", "linear")).lower()
-    if head_type not in {"linear", "mlp5", "mlp12", "transformer"}:
+    if head_type not in {"linear", "mlp3", "mlp5", "mlp12", "transformer"}:
         raise ValueError(
-            "classifier_head.type must be one of ['linear', 'mlp5', 'mlp12', 'transformer'], "
+            "classifier_head.type must be one of ['linear', 'mlp3', 'mlp5', 'mlp12', 'transformer'], "
             f"got {head_type!r}"
         )
     defaults["type"] = head_type
@@ -205,24 +205,31 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
     defaults["use_layernorm"] = bool(defaults.get("use_layernorm", True))
     defaults["use_positional_encoding"] = bool(defaults.get("use_positional_encoding", True))
 
-    if head_type in {"mlp5", "mlp12"}:
+    if head_type in {"mlp3", "mlp5", "mlp12"}:
+        mlp_default_hidden: dict[str, list[int]] = {
+            "mlp3": [128, 64, 32],
+            "mlp5": [1024, 256, 128, 64],
+            "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
+        }
+        expected_hidden_layers = {"mlp3": 3, "mlp5": 4, "mlp12": 11}
         if "hidden_dims" not in provided:
-            if head_type == "mlp5":
-                defaults["hidden_dims"] = [1024, 256, 128, 64]
-            else:
-                defaults["hidden_dims"] = [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64]
-        hidden_dims = defaults.get("hidden_dims", [1024, 256, 128, 64])
+            defaults["hidden_dims"] = mlp_default_hidden[head_type]
+        hidden_dims = defaults.get("hidden_dims", mlp_default_hidden[head_type])
         if not isinstance(hidden_dims, list) or len(hidden_dims) == 0:
             raise ValueError("classifier_head.hidden_dims must be a non-empty list.")
         hidden_dims = [int(dim) for dim in hidden_dims]
         if any(dim <= 0 for dim in hidden_dims):
             raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims!r}")
         defaults["hidden_dims"] = hidden_dims
-        expected_hidden_layers = {"mlp5": 4, "mlp12": 11}
         if len(hidden_dims) != expected_hidden_layers[head_type]:
             raise ValueError(
                 f"classifier_head.hidden_dims for {head_type} must contain exactly "
                 f"{expected_hidden_layers[head_type]} integers, got {hidden_dims!r}"
+            )
+        if head_type == "mlp3" and any(dim > 128 for dim in hidden_dims):
+            raise ValueError(
+                "classifier_head.hidden_dims for mlp3 must use widths <= 128 "
+                f"(compact head), got {hidden_dims!r}"
             )
     else:
         defaults["hidden_dims"] = []

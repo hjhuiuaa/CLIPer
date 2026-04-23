@@ -70,6 +70,39 @@ def test_load_config_accepts_stage3_mlp12_defaults(tmp_path: Path) -> None:
     assert len(loaded["classifier_head"]["hidden_dims"]) == 11
 
 
+def test_load_config_accepts_stage3_mlp3_defaults(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp3"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_mlp3.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["classifier_head"]["type"] == "mlp3"
+    assert loaded["classifier_head"]["hidden_dims"] == [128, 64, 32]
+
+
+def test_load_config_rejects_mlp3_hidden_dim_above_128(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp3", "hidden_dims": [256, 64, 32]},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage3_mlp3_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mlp3"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_invalid_mlp12_hidden_dims_length(tmp_path: Path) -> None:
     config = _base_config()
     config.update(
