@@ -14,12 +14,18 @@ Stage 2 adds supervised contrastive learning on top of the same residue-level bi
 
 Stage 3 validates pure architecture gain with a deeper classification head:
 - **Objective:** `BCEWithLogitsLoss` only (no contrastive term)
-- **Head options:** `classifier_head.type=mlp5` / `mlp12` / `transformer`
+- **Head options:** `classifier_head.type=mlp3` / `mlp5` / `mlp12` / `transformer`
 - **MLP5 layout:** `hidden -> 1024 -> 256 -> 128 -> 64 -> 1`
 - **MLP12 layout:** `hidden -> 1024 -> 1024 -> 768 -> 768 -> 512 -> 512 -> 256 -> 256 -> 128 -> 128 -> 64 -> 1`
 - **Transformer layout:** residue-wise encoder (`num_layers=2`, `num_heads=4`, `ffn_dim=2048`) + per-residue linear classifier
 - **Hidden blocks:** each hidden layer uses `ReLU + LayerNorm + Dropout(0.3)`
 - **Backbone policy:** keep ProstT5 frozen; train classification head only
+
+Stage 4 extends Stage 3 with local residue-context concatenation and alternative heads:
+- **Objective:** `BCEWithLogitsLoss` only (contrastive forced off, same as Stage 3)
+- **Local context:** `local_context.mode=concat_window` concatenates neighboring residue embeddings before the head
+- **Head options:** `mlp3` / `mlp5` / `mlp12` / `transformer` / `cnn`
+- **CNN head:** `conv_channels + dilations` Conv1d stack for residue-wise logits
 
 ## Stage 1 Pipeline
 The implementation includes:
@@ -87,6 +93,11 @@ python -m cliper.cli train --config configs/stage3_prostt5_mlp12.yaml
 python -m cliper.cli train --config configs/stage3_prostt5_transformer.yaml
 ```
 
+### 2f) Train Stage 4 model (CNN head + concat_window)
+```bash
+python -m cliper.cli train --config configs/stage4_prostt5_cnn_concat_window.yaml
+```
+
 Stage 2 configuration keys:
 - `stage: stage2`
 - `contrastive.enabled`
@@ -114,10 +125,20 @@ Stage 3 configuration keys:
 - `classifier_head.activation`
 - `contrastive.enabled: false`
 
-Stage 3 runtime behavior:
-- If `stage: stage3` and config sets `contrastive.enabled: true`, pipeline will force it to `false` and log:
-  `"[stage3] contrastive.enabled=true ignored; forced to false for stage3."`
-- Stage 3 loss remains pure BCE (`BCEWithLogitsLoss`) for controlled architecture-only validation.
+Stage 4 additional configuration keys:
+- `stage: stage4`
+- `local_context.enabled`
+- `local_context.radius`
+- `local_context.mode: concat_window`
+- `local_context.include_self`
+- `classifier_head.type: cnn` (optional)
+- `classifier_head.conv_channels` (cnn)
+- `classifier_head.kernel_size` (cnn, odd integer)
+- `classifier_head.dilations` (cnn; length must match `conv_channels`)
+
+Stage 3/4 runtime behavior:
+- If `stage: stage3` or `stage: stage4` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
+- Stage 3/4 loss remains pure BCE (`BCEWithLogitsLoss`) for controlled architecture-only validation.
 
 W&B（Weights & Biases）配置（按每次实验 YAML 生效参数记录）：
 - `use_wandb`
@@ -223,6 +244,9 @@ Visualization behavior:
 - Stage 3 config template: [`configs/stage3_prostt5_mlp5.yaml`](configs/stage3_prostt5_mlp5.yaml).
 - Stage 3 (MLP12) config template: [`configs/stage3_prostt5_mlp12.yaml`](configs/stage3_prostt5_mlp12.yaml).
 - Stage 3 (Transformer) config template: [`configs/stage3_prostt5_transformer.yaml`](configs/stage3_prostt5_transformer.yaml).
+- Stage 4 (CNN + concat_window) config template: [`configs/stage4_prostt5_cnn_concat_window.yaml`](configs/stage4_prostt5_cnn_concat_window.yaml).
+- Stage 4 (CNN T1 regularized) config template: [`configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml`](configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml).
+- Stage 4 (CNN T3 balanced) config template: [`configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml`](configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml).
 - For local tests without downloading a backbone, use `backbone_name: dummy` in config.
 - `save_every` / `print_every` / `eval_every` 默认单位是训练 step（global step）。
 - TensorBoard 自动启动相关参数：`auto_start_tensorboard` / `tensorboard_host` / `tensorboard_port`。

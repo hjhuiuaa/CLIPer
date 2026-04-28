@@ -4,7 +4,7 @@ Disorder training/eval pipeline: reuses cliper.train/evaluate with patched windo
 - Training: overlapping grid of crops; prefers windows that do not bisect contiguous positive runs.
 - Eval / holdout: sliding windows with overlap, logits merged by mean (same as linker merge_window_logits).
 
-Stage (stage1/2/3), backbone, and classifier head (linear / mlp5 / mlp12 / transformer) are unchanged from
+Stage (stage1/2/3/4), backbone, and classifier head (linear / mlp5 / mlp12 / transformer) are unchanged from
 CLIPer: set `stage` and `classifier_head` in the YAML (see disorder/configs/disorder_stage3_mlp5_example.yaml).
 
 Precomputed ProstT5 embeddings (one file per protein, one line per residue): use CLI `extract_features`,
@@ -227,8 +227,36 @@ def evaluate(
         cp.evaluate_records = _orig_er
 
 
+def prepare_data_fixed_train_val(
+    *,
+    train_label_fasta: str | Path,
+    val_label_fasta: str | Path,
+    holdout_fasta: str | Path,
+    error_file: str | Path | None,
+    split_out: str | Path,
+    exclusion_out: str | Path,
+) -> dict[str, Any]:
+    """Write split manifest from existing train/val labeled FASTA (see CLI prepare_split)."""
+    from disorder.fasta_parsing import build_fixed_train_val_split_manifest, write_json
+
+    split_manifest, exclusion_report = build_fixed_train_val_split_manifest(
+        train_label_fasta=train_label_fasta,
+        val_label_fasta=val_label_fasta,
+        holdout_fasta=holdout_fasta,
+        error_file=error_file,
+    )
+    write_json(split_out, split_manifest)
+    write_json(exclusion_out, exclusion_report)
+    return {
+        "split_manifest_path": str(Path(split_out)),
+        "exclusion_report_path": str(Path(exclusion_out)),
+        "counts": split_manifest["counts"],
+    }
+
+
 __all__ = [
     "prepare_data",
+    "prepare_data_fixed_train_val",
     "train",
     "evaluate",
     "load_disorder_config",

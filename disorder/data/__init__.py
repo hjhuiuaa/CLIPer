@@ -2,6 +2,7 @@
 
 from disorder.fasta_parsing import (
     ProteinRecord,
+    build_fixed_train_val_split_manifest,
     build_split_manifest,
     load_disorder_labeled_pair,
     parse_id_lines,
@@ -14,6 +15,7 @@ from disorder.fasta_parsing import (
 
 __all__ = [
     "ProteinRecord",
+    "build_fixed_train_val_split_manifest",
     "build_split_manifest",
     "load_disorder_labeled_pair",
     "parse_id_lines",

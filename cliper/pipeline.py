@@ -105,6 +105,15 @@ DEFAULTS = {
         "num_heads": 4,
         "ffn_dim": 2048,
         "use_positional_encoding": True,
+        "conv_channels": [256, 256, 256],
+        "kernel_size": 3,
+        "dilations": [1, 2, 4],
+    },
+    "local_context": {
+        "enabled": False,
+        "radius": 2,
+        "mode": "concat_window",
+        "include_self": True,
     },
     "contrastive": {
         "enabled": False,
@@ -186,9 +195,9 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
     defaults.update(provided)
 
     head_type = str(defaults.get("type", "linear")).lower()
-    if head_type not in {"linear", "mlp3", "mlp5", "mlp12", "transformer"}:
+    if head_type not in {"linear", "mlp3", "mlp5", "mlp12", "transformer", "cnn"}:
         raise ValueError(
-            "classifier_head.type must be one of ['linear', 'mlp3', 'mlp5', 'mlp12', 'transformer'], "
+            "classifier_head.type must be one of ['linear', 'mlp3', 'mlp5', 'mlp12', 'transformer', 'cnn'], "
             f"got {head_type!r}"
         )
     defaults["type"] = head_type
@@ -247,7 +256,48 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
         defaults["num_layers"] = num_layers
         defaults["num_heads"] = num_heads
         defaults["ffn_dim"] = ffn_dim
+    elif head_type == "cnn":
+        conv_channels = defaults.get("conv_channels", [256, 256, 256])
+        if not isinstance(conv_channels, list) or len(conv_channels) == 0:
+            raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+        conv_channels = [int(ch) for ch in conv_channels]
+        if any(ch <= 0 for ch in conv_channels):
+            raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+        kernel_size = int(defaults.get("kernel_size", 3))
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+        raw_dilations = defaults.get("dilations", [1, 2, 4])
+        if not isinstance(raw_dilations, list) or len(raw_dilations) != len(conv_channels):
+            raise ValueError(
+                "classifier_head.dilations must be a list with same length as conv_channels, "
+                f"got dilations={raw_dilations!r}, conv_channels={conv_channels!r}"
+            )
+        dilations = [int(d) for d in raw_dilations]
+        if any(d <= 0 for d in dilations):
+            raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+        defaults["conv_channels"] = conv_channels
+        defaults["kernel_size"] = kernel_size
+        defaults["dilations"] = dilations
 
+    return defaults
+
+
+def _resolve_local_context_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("local_context", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("local_context must be a dict when provided.")
+    defaults = dict(DEFAULTS["local_context"])
+    defaults.update(raw)
+    defaults["enabled"] = bool(defaults.get("enabled", False))
+    defaults["radius"] = int(defaults.get("radius", 2))
+    defaults["mode"] = str(defaults.get("mode", "concat_window")).lower()
+    defaults["include_self"] = bool(defaults.get("include_self", True))
+    if defaults["radius"] < 0:
+        raise ValueError(f"local_context.radius must be >= 0, got {defaults['radius']}")
+    if defaults["mode"] not in {"concat_window"}:
+        raise ValueError("local_context.mode must be one of ['concat_window']")
     return defaults
 
 
@@ -285,14 +335,17 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     merged.update(config)
     stage = str(merged.get("stage", "stage1")).lower()
-    if stage not in {"stage1", "stage2", "stage3"}:
-        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3'], got {stage!r}")
+    if stage not in {"stage1", "stage2", "stage3", "stage4"}:
+        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3', 'stage4'], got {stage!r}")
     merged["stage"] = stage
     merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
     merged["classifier_head"] = _resolve_classifier_head_config(config)
+    merged["local_context"] = _resolve_local_context_config(config)
+    merged["stage_contrastive_forced_off"] = False
     merged["stage3_contrastive_forced_off"] = False
-    if stage == "stage3" and bool(merged["contrastive"].get("enabled", False)):
+    if stage in {"stage3", "stage4"} and bool(merged["contrastive"].get("enabled", False)):
         merged["contrastive"]["enabled"] = False
+        merged["stage_contrastive_forced_off"] = True
         merged["stage3_contrastive_forced_off"] = True
     if merged["optimizer"].lower() != "adamw":
         raise ValueError("Only optimizer=adamw is supported.")
@@ -1088,8 +1141,8 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         f"Run stage={stage} contrastive_enabled={contrastive_enabled} "
         f"contrastive_weight={contrastive_weight:.4f}"
     )
-    if bool(config.get("stage3_contrastive_forced_off", False)):
-        log("[stage3] contrastive.enabled=true ignored; forced to false for stage3.")
+    if bool(config.get("stage_contrastive_forced_off", False)):
+        log(f"[{stage}] contrastive.enabled=true ignored; forced to false for {stage}.")
     tensorboard_info = _start_tensorboard_if_needed(
         enabled=bool(config.get("auto_start_tensorboard", True)),
         logdir=output_base_dir,
@@ -1166,6 +1219,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         freeze_backbone=bool(config["freeze_backbone"]),
         projection_dim=int(contrastive_cfg["proj_dim"]),
         classifier_head=classifier_head_cfg,
+        local_context=dict(config.get("local_context", {})),
     ).to(device)
 
     batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
@@ -1863,6 +1917,7 @@ def evaluate(
         freeze_backbone=bool(config.get("freeze_backbone", True)),
         projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
         classifier_head=classifier_head_cfg,
+        local_context=dict(config.get("local_context", {})),
     )
     _load_model_state(model, checkpoint["model_state"], logger=log)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))

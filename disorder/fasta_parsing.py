@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cliper.data import (
@@ -15,8 +16,22 @@ from cliper.data import (
     write_json,
 )
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _parse_id_lines_or_empty(path: str | Path | None) -> set[str]:
+    if path is None:
+        return set()
+    source = Path(path)
+    if not source.exists():
+        return set()
+    return parse_id_lines(source)
+
+
 __all__ = [
     "ProteinRecord",
+    "build_fixed_train_val_split_manifest",
     "build_split_manifest",
     "load_disorder_labeled_pair",
     "parse_id_lines",
@@ -79,3 +94,85 @@ def load_disorder_labeled_pair(sequence_fasta: str | Path, label_fasta: str | Pa
             )
         records.append(rec)
     return records
+
+
+def build_fixed_train_val_split_manifest(
+    *,
+    train_label_fasta: str | Path,
+    val_label_fasta: str | Path,
+    holdout_fasta: str | Path,
+    error_file: str | Path | None = None,
+) -> tuple[dict, dict]:
+    """
+    Build train/val split from two disjoint 3-line labeled FASTA files (no random split).
+    Removes ids appearing in error_file (optional) or in holdout_fasta.
+    """
+    train_label_fasta = Path(train_label_fasta)
+    val_label_fasta = Path(val_label_fasta)
+    holdout_fasta = Path(holdout_fasta)
+
+    train_recs = parse_three_line_fasta(train_label_fasta)
+    val_recs = parse_three_line_fasta(val_label_fasta)
+    train_ids = {r.protein_id for r in train_recs}
+    val_ids = {r.protein_id for r in val_recs}
+    overlap = train_ids & val_ids
+    if overlap:
+        sample = ", ".join(sorted(overlap)[:10])
+        raise ValueError(f"train and val label FASTA share {len(overlap)} id(s), e.g.: {sample}")
+
+    record_ids = train_ids | val_ids
+    caid_ids = parse_id_lines(holdout_fasta)
+    error_ids = _parse_id_lines_or_empty(error_file)
+
+    excluded_error_ids = sorted(record_ids & error_ids)
+    holdout_overlap_ids = sorted(record_ids & caid_ids)
+    missing_error_ids = sorted(error_ids - record_ids)
+
+    drop = set(excluded_error_ids) | set(holdout_overlap_ids)
+    train_final = sorted(train_ids - drop)
+    val_final = sorted(val_ids - drop)
+
+    if len(train_final) < 1 or len(val_final) < 1:
+        raise ValueError(
+            "After exclusions, need at least one train and one val protein. "
+            f"train_final={len(train_final)} val_final={len(val_final)} "
+            f"excluded_error={len(excluded_error_ids)} holdout_overlap={len(holdout_overlap_ids)}"
+        )
+
+    split_manifest = {
+        "generated_at_utc": _utc_now_iso(),
+        "split_mode": "fixed_train_val_files",
+        "train_label_fasta": str(train_label_fasta.resolve()),
+        "val_label_fasta": str(val_label_fasta.resolve()),
+        "source_fasta": f"{train_label_fasta.resolve()}|{val_label_fasta.resolve()}",
+        "seed": None,
+        "val_ratio": None,
+        "counts": {
+            "source_train_records": len(train_ids),
+            "source_val_records": len(val_ids),
+            "eligible_records": len(train_final) + len(val_final),
+            "train_records": len(train_final),
+            "val_records": len(val_final),
+            "excluded_error_records": len(excluded_error_ids),
+            "excluded_holdout_overlap_records": len(holdout_overlap_ids),
+        },
+        "train_ids": train_final,
+        "val_ids": val_final,
+        "excluded_error_ids": excluded_error_ids,
+        "excluded_holdout_overlap_ids": holdout_overlap_ids,
+        "caid_holdout_ids": sorted(caid_ids),
+    }
+
+    exclusion_report = {
+        "generated_at_utc": _utc_now_iso(),
+        "split_mode": "fixed_train_val_files",
+        "train_label_fasta": str(train_label_fasta.resolve()),
+        "val_label_fasta": str(val_label_fasta.resolve()),
+        "error_id_count_in_file": len(error_ids),
+        "error_ids_present_in_source": excluded_error_ids,
+        "error_ids_missing_from_source": missing_error_ids,
+        "holdout_overlap_ids": holdout_overlap_ids,
+        "excluded_total": len(excluded_error_ids) + len(holdout_overlap_ids),
+    }
+
+    return split_manifest, exclusion_report

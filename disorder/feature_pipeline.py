@@ -56,6 +56,12 @@ DEFAULT_FEATURE_CONFIG: dict[str, Any] = {
     "tensorboard_dir": None,
     "resume_checkpoint": None,
     "hidden_size": None,
+    "local_context": {
+        "enabled": False,
+        "radius": 2,
+        "mode": "concat_mean",
+        "include_self": False,
+    },
 }
 
 REQUIRED_FEATURE_CONFIG = [
@@ -93,13 +99,93 @@ def load_feature_train_config(path: str | Path) -> dict[str, Any]:
     ts = merged.get("threshold_search")
     if not isinstance(ts, dict) or not all(k in ts for k in ("min", "max", "step")):
         raise ValueError("threshold_search must be a dict with min, max, step.")
+    merged["local_context"] = _resolve_local_context(merged)
     return merged
 
 
 def _resolve_hidden_size(cfg: dict[str, Any]) -> int:
     if cfg.get("hidden_size") is not None:
-        return int(cfg["hidden_size"])
-    return manifest_hidden_size(cfg["features_dir"])
+        base_hidden = int(cfg["hidden_size"])
+    else:
+        base_hidden = manifest_hidden_size(cfg["features_dir"])
+    local_context = cfg.get("local_context", {})
+    if isinstance(local_context, dict) and bool(local_context.get("enabled", False)):
+        mode = str(local_context.get("mode", "concat_mean")).lower()
+        if mode == "concat_mean":
+            return base_hidden * 2
+        if mode == "concat_window":
+            radius = int(local_context.get("radius", 2))
+            include_self = bool(local_context.get("include_self", True))
+            width = (2 * radius + 1) if include_self else (2 * radius)
+            if width <= 0:
+                raise ValueError("local_context concat_window produced width <= 0.")
+            return base_hidden * width
+        raise ValueError(f"Unsupported local_context.mode: {mode!r}")
+    return base_hidden
+
+
+def _resolve_local_context(cfg: dict[str, Any]) -> dict[str, Any]:
+    raw = cfg.get("local_context")
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("local_context must be a dict when provided.")
+    merged = dict(DEFAULT_FEATURE_CONFIG["local_context"])
+    merged.update(raw)
+    merged["enabled"] = bool(merged.get("enabled", False))
+    merged["radius"] = int(merged.get("radius", 2))
+    merged["mode"] = str(merged.get("mode", "concat_mean")).lower()
+    merged["include_self"] = bool(merged.get("include_self", True))
+    if merged["radius"] < 0:
+        raise ValueError(f"local_context.radius must be >= 0, got {merged['radius']}")
+    if merged["mode"] not in {"concat_mean", "concat_window"}:
+        raise ValueError("local_context.mode must be one of ['concat_mean', 'concat_window']")
+    if merged["enabled"] and merged["mode"] == "concat_window":
+        width = (2 * merged["radius"] + 1) if merged["include_self"] else (2 * merged["radius"])
+        if width <= 0:
+            raise ValueError("local_context concat_window requires non-empty neighborhood.")
+    return merged
+
+
+def _augment_with_local_context(feats: torch.Tensor, local_context: dict[str, Any]) -> torch.Tensor:
+    if feats.dim() != 2:
+        raise ValueError(f"Expected [L, D] feature tensor, got shape {tuple(feats.shape)}")
+    if not bool(local_context.get("enabled", False)):
+        return feats
+    radius = int(local_context.get("radius", 2))
+    if radius <= 0:
+        return feats
+    mode = str(local_context.get("mode", "concat_mean")).lower()
+    include_self = bool(local_context.get("include_self", False))
+    length = int(feats.shape[0])
+    if mode == "concat_mean":
+        ctx = torch.zeros_like(feats)
+        for idx in range(length):
+            start = max(0, idx - radius)
+            end = min(length, idx + radius + 1)
+            window = feats[start:end]
+            if not include_self and window.shape[0] > 1:
+                center = idx - start
+                window = torch.cat([window[:center], window[center + 1 :]], dim=0)
+            ctx[idx] = window.mean(dim=0)
+        return torch.cat([feats, ctx], dim=1)
+    if mode == "concat_window":
+        chunks: list[torch.Tensor] = []
+        for idx in range(length):
+            parts: list[torch.Tensor] = []
+            for offset in range(-radius, radius + 1):
+                if offset == 0 and not include_self:
+                    continue
+                neighbor = idx + offset
+                if 0 <= neighbor < length:
+                    parts.append(feats[neighbor])
+                else:
+                    parts.append(torch.zeros_like(feats[idx]))
+            if not parts:
+                raise ValueError("local_context concat_window produced no parts.")
+            chunks.append(torch.cat(parts, dim=0))
+        return torch.stack(chunks, dim=0)
+    raise ValueError(f"Unsupported local_context.mode: {mode!r}")
 
 
 def _ensure_feature_files(records: list[ProteinRecord], features_dir: str | Path) -> None:
@@ -161,6 +247,7 @@ def evaluate_feature_records(
     threshold: float | None,
     threshold_search: dict[str, float],
     mixed_precision: bool,
+    local_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model.eval()
     root = Path(features_dir)
@@ -172,6 +259,8 @@ def evaluate_feature_records(
     for record in records:
         path = feature_file_path(root, record.protein_id)
         feats = read_residue_feature_file(path)
+        if local_context is not None:
+            feats = _augment_with_local_context(feats, local_context)
         length = int(feats.shape[0])
         if length != len(record.sequence):
             raise ValueError(
@@ -247,6 +336,7 @@ class DisorderFeatureTrainDataset(Dataset):
         overlap: int,
         seed: int,
         split_penalty_weight: float,
+        local_context: dict[str, Any] | None = None,
     ) -> None:
         self.records = records
         self.features_dir = Path(features_dir)
@@ -254,6 +344,7 @@ class DisorderFeatureTrainDataset(Dataset):
         self.overlap = overlap
         self.seed = seed
         self.split_penalty_weight = split_penalty_weight
+        self.local_context = local_context or dict(DEFAULT_FEATURE_CONFIG["local_context"])
 
     def __len__(self) -> int:
         return len(self.records)
@@ -262,6 +353,7 @@ class DisorderFeatureTrainDataset(Dataset):
         record = self.records[index]
         path = feature_file_path(self.features_dir, record.protein_id)
         full = read_residue_feature_file(path)
+        full = _augment_with_local_context(full, self.local_context)
         if full.shape[0] != len(record.sequence):
             raise ValueError(
                 f"Feature/sequence length mismatch for {record.protein_id}: "
@@ -325,6 +417,7 @@ def train_features(config_path: str | Path, resume_checkpoint: str | Path | None
         overlap=int(cfg["window_overlap"]),
         seed=int(cfg["seed"]),
         split_penalty_weight=float(cfg["train_split_penalty_weight"]),
+        local_context=dict(cfg["local_context"]),
     )
     train_loader = DataLoader(
         train_ds,
@@ -402,6 +495,7 @@ def train_features(config_path: str | Path, resume_checkpoint: str | Path | None
             threshold=None,
             threshold_search=dict(cfg["threshold_search"]),
             mixed_precision=use_amp,
+            local_context=dict(cfg["local_context"]),
         )
         vm = val_result["metrics"]
         th = float(val_result["threshold"])
@@ -585,6 +679,7 @@ def eval_features_checkpoint(
         threshold=threshold,
         threshold_search=dict(cfg.get("threshold_search", DEFAULT_FEATURE_CONFIG["threshold_search"])),
         mixed_precision=use_amp,
+        local_context=dict(cfg.get("local_context", DEFAULT_FEATURE_CONFIG["local_context"])),
     )
     out: dict[str, Any] = {
         "checkpoint": str(Path(checkpoint_path).resolve()),

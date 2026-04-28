@@ -1,0 +1,62 @@
+stage: stage4
+backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
+window_size: 1024
+batch_tokens: 2048
+optimizer: adamw
+lr: 0.0003
+weight_decay: 0.01
+max_epochs: 30
+early_stop_patience: 5
+seed: 42
+threshold_search:
+  min: 0.05
+  max: 0.95
+  step: 0.05
+
+dropout: 0.1
+freeze_backbone: true
+eval_stride: 512
+top_k_heuristic: 4
+num_workers: 0
+device: cuda
+
+# Radius sweep setting: [i-3, i-2, i-1, i, i+1, i+2, i+3]
+local_context:
+  enabled: true
+  radius: 3
+  mode: concat_window
+  include_self: true
+
+classifier_head:
+  type: mlp5
+  dropout: 0.3
+  dropout_schedule: [0.35, 0.25, 0.15, 0.10]
+  use_layernorm: true
+  activation: relu
+  hidden_dims: [1024, 512, 128, 32]
+
+contrastive:
+  enabled: false
+  weight: 0.2
+  temperature: 0.1
+  proj_dim: 128
+  max_samples_per_class: 256
+
+train_fasta: dataset/disprot_202312_linker_label.fasta
+caid_fasta: dataset/linker.fasta
+split_manifest: artifacts/splits/disprot_split_seed42.json
+output_dir: artifacts/runs/stage4_prostt5_mlp5_concat_window_r3
+experiment_prefix: exp
+save_every: 500
+print_every: 20
+eval_every: 200
+auto_start_tensorboard: true
+tensorboard_host: 0.0.0.0
+tensorboard_port: 6006
+use_wandb: false
+wandb_entity: 3151599052-nankai-university
+wandb_project: CLIPer
+wandb_mode: online
+wandb_run_name: null
+wandb_group: stage4_mlp5_concat_window_r3
+wandb_tags: [stage4, bce, mlp5, concat_window, radius3]

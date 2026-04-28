@@ -96,6 +96,71 @@ def _sinusoidal_position_encoding(length: int, dim: int, *, device: torch.device
     return pe.to(dtype=dtype)
 
 
+def _resolve_local_context(local_context: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(local_context or {})
+    enabled = bool(cfg.get("enabled", False))
+    radius = int(cfg.get("radius", 2))
+    mode = str(cfg.get("mode", "concat_window")).lower()
+    include_self = bool(cfg.get("include_self", True))
+    if radius < 0:
+        raise ValueError(f"local_context.radius must be >= 0, got {radius}")
+    if mode != "concat_window":
+        raise ValueError("local_context.mode must be 'concat_window' for ResidueClassifier.")
+    if enabled and radius == 0 and not include_self:
+        raise ValueError("local_context requires at least one feature when enabled.")
+    return {
+        "enabled": enabled,
+        "radius": radius,
+        "mode": mode,
+        "include_self": include_self,
+    }
+
+
+def _local_context_multiplier(local_context: dict[str, Any]) -> int:
+    if not bool(local_context.get("enabled", False)):
+        return 1
+    radius = int(local_context.get("radius", 2))
+    include_self = bool(local_context.get("include_self", True))
+    span = (2 * radius + 1) if include_self else (2 * radius)
+    if span <= 0:
+        raise ValueError("local_context produced empty span; check radius/include_self.")
+    return span
+
+
+def _concat_local_window(x: torch.Tensor, residue_lengths: list[int], local_context: dict[str, Any]) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError(f"Expected [B, L, H] input, got {tuple(x.shape)}")
+    if not bool(local_context.get("enabled", False)):
+        return x
+    radius = int(local_context.get("radius", 2))
+    if radius <= 0:
+        return x
+
+    include_self = bool(local_context.get("include_self", True))
+    batch, max_len, _ = x.shape
+    lengths = torch.tensor(residue_lengths, device=x.device, dtype=torch.long)
+    if int(lengths.max().item()) > max_len:
+        raise ValueError(f"residue_lengths has value > max_len ({max_len}): {residue_lengths!r}")
+    valid_mask = torch.arange(max_len, device=x.device).unsqueeze(0).expand(batch, max_len) < lengths.unsqueeze(1)
+    x = x * valid_mask.unsqueeze(-1).to(x.dtype)
+    positions = torch.arange(max_len, device=x.device)
+
+    chunks: list[torch.Tensor] = []
+    for offset in range(-radius, radius + 1):
+        if offset == 0 and not include_self:
+            continue
+        idx = positions + offset
+        in_bounds = (idx >= 0) & (idx < max_len)
+        safe_idx = idx.clamp(min=0, max=max_len - 1)
+        shifted = x[:, safe_idx, :]
+        neighbor_valid = valid_mask[:, safe_idx] & in_bounds.unsqueeze(0)
+        shifted = shifted * neighbor_valid.unsqueeze(-1).to(shifted.dtype)
+        chunks.append(shifted)
+    if not chunks:
+        raise ValueError("local_context concat_window produced no chunks.")
+    return torch.cat(chunks, dim=-1)
+
+
 class MLPClassifierHead(nn.Module):
     def __init__(
         self,
@@ -188,6 +253,58 @@ class TransformerClassifierHead(nn.Module):
         return self.classifier(encoded)
 
 
+class CNNClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        conv_channels: list[int],
+        kernel_size: int,
+        dilations: list[int] | None,
+        dropout: float,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"cnn input_dim must be > 0, got {input_dim}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+        if not conv_channels:
+            raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+        channels = [int(ch) for ch in conv_channels]
+        if any(ch <= 0 for ch in channels):
+            raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+        if dilations is None:
+            dils = [1] * len(channels)
+        else:
+            if len(dilations) != len(channels):
+                raise ValueError(
+                    "classifier_head.dilations length must match conv_channels length: "
+                    f"{len(dilations)} vs {len(channels)}"
+                )
+            dils = [int(d) for d in dilations]
+            if any(d <= 0 for d in dils):
+                raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+
+        layers: list[nn.Module] = []
+        in_ch = input_dim
+        for out_ch, dil in zip(channels, dils):
+            pad = dil * (kernel_size - 1) // 2
+            layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, dilation=dil))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            in_ch = out_ch
+        self.conv = nn.Sequential(*layers)
+        self.classifier = nn.Conv1d(in_ch, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, L, H] -> [B, H, L] for conv1d along residues.
+        y = x.transpose(1, 2)
+        y = self.conv(y)
+        y = self.classifier(y)
+        return y.transpose(1, 2)
+
+
 class ResidueClassifier(nn.Module):
     def __init__(
         self,
@@ -197,17 +314,20 @@ class ResidueClassifier(nn.Module):
         freeze_backbone: bool = True,
         projection_dim: int = 128,
         classifier_head: dict[str, Any] | None = None,
+        local_context: dict[str, Any] | None = None,
     ):
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
         self.dropout = nn.Dropout(dropout)
+        self.local_context = _resolve_local_context(local_context)
+        classifier_input_dim = hidden_size * _local_context_multiplier(self.local_context)
 
         classifier_cfg = dict(classifier_head or {})
         head_type = str(classifier_cfg.get("type", "linear")).lower()
         self.classifier_type = head_type
         if head_type == "linear":
-            self.classifier = nn.Linear(hidden_size, 1)
+            self.classifier = nn.Linear(classifier_input_dim, 1)
         elif head_type in {"mlp3", "mlp5", "mlp12"}:
             default_hidden_dims_map: dict[str, list[int]] = {
                 "mlp3": [128, 64, 32],
@@ -230,7 +350,7 @@ class ResidueClassifier(nn.Module):
                     f"got {hidden_dims_raw!r}"
                 )
             self.classifier = MLPClassifierHead(
-                input_dim=hidden_size,
+                input_dim=classifier_input_dim,
                 hidden_dims=hidden_dims,
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 dropout_schedule=(
@@ -243,7 +363,7 @@ class ResidueClassifier(nn.Module):
             )
         elif head_type == "transformer":
             self.classifier = TransformerClassifierHead(
-                input_dim=hidden_size,
+                input_dim=classifier_input_dim,
                 num_layers=int(classifier_cfg.get("num_layers", 2)),
                 num_heads=int(classifier_cfg.get("num_heads", 4)),
                 ffn_dim=int(classifier_cfg.get("ffn_dim", 2048)),
@@ -251,11 +371,24 @@ class ResidueClassifier(nn.Module):
                 activation=str(classifier_cfg.get("activation", "relu")),
                 use_positional_encoding=bool(classifier_cfg.get("use_positional_encoding", True)),
             )
+        elif head_type == "cnn":
+            self.classifier = CNNClassifierHead(
+                input_dim=classifier_input_dim,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+            )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
 
         self.projection_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            nn.Linear(classifier_input_dim, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, projection_dim),
         )
@@ -285,7 +418,8 @@ class ResidueClassifier(nn.Module):
                 f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
             )
         residue_hidden = hidden[:, :max_len, :]
-        classifier_input = self.dropout(residue_hidden)
+        contextual_hidden = _concat_local_window(residue_hidden, residue_lengths, self.local_context)
+        classifier_input = self.dropout(contextual_hidden)
         if self.classifier_type == "transformer":
             padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
             logits = self.classifier(classifier_input, padding_mask=padding_mask).squeeze(-1)

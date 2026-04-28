@@ -29,8 +29,10 @@ top_k_heuristic: 4
 num_workers: 0
 device: cuda
 
-train_fasta: /data/huggs/hujh/disorder/disprot_train_label.fasta
-caid_fasta: /data/huggs/hujh/disorder/disprot_holdout.fasta
+# train_fasta: all train∪val labeled records (3-line). Merge train + val label FASTA, e.g.:
+#   cat disorder/data/train_rmSimi_label.fasta disorder/data/val_rmSimi_label.fasta > disorder/data/train_val_labeled.fasta
+train_fasta: disorder/data/train_val_labeled.fasta
+caid_fasta: disorder/data/test_label.fasta
 split_manifest: disorder/artifacts/splits/disorder_split_seed42.json
 output_dir: disorder/artifacts/runs/disorder_stage1
 experiment_prefix: exp

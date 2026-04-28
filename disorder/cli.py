@@ -17,11 +17,30 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--output-split", default="disorder/artifacts/splits/disorder_split_seed42.json")
     prepare_parser.add_argument("--output-exclusion", default="disorder/artifacts/splits/disorder_exclusion_seed42.json")
 
+    ps_parser = subparsers.add_parser(
+        "prepare_split",
+        help="Fixed train/val split from two 3-line label FASTA (no merge file, no random split).",
+    )
+    ps_parser.add_argument("--train-label-fasta", required=True, help="Training split, 3-line labeled FASTA.")
+    ps_parser.add_argument("--val-label-fasta", required=True, help="Validation split, 3-line labeled FASTA.")
+    ps_parser.add_argument(
+        "--holdout-fasta",
+        required=True,
+        help="Test/holdout FASTA (ids must not appear in train/val; >headers only).",
+    )
+    ps_parser.add_argument(
+        "--error-file",
+        default=None,
+        help="Optional id list file; if omitted or missing, no error ids are applied.",
+    )
+    ps_parser.add_argument("--output-split", default="disorder/artifacts/splits/disorder_split_seed42.json")
+    ps_parser.add_argument("--output-exclusion", default="disorder/artifacts/splits/disorder_exclusion_seed42.json")
+
     train_parser = subparsers.add_parser("train", help="Train with disorder windowing (patches cliper train).")
     train_parser.add_argument(
         "--config",
         required=True,
-        help="YAML config under disorder/configs/ (e.g. disorder_stage3_mlp5_example.yaml for stage3+mlp5).",
+        help="YAML config under disorder/configs/ (e.g. disorder_stage3_mlp5_example.yaml or stage4 config).",
     )
     train_parser.add_argument("--resume-checkpoint", default=None)
 
@@ -81,6 +100,17 @@ def main(argv: list[str] | None = None) -> int:
             caid_fasta=args.holdout_fasta,
             seed=args.seed,
             val_ratio=args.val_ratio,
+            split_out=args.output_split,
+            exclusion_out=args.output_exclusion,
+        )
+    elif args.command == "prepare_split":
+        from disorder.pipeline import prepare_data_fixed_train_val
+
+        result = prepare_data_fixed_train_val(
+            train_label_fasta=args.train_label_fasta,
+            val_label_fasta=args.val_label_fasta,
+            holdout_fasta=args.holdout_fasta,
+            error_file=args.error_file,
             split_out=args.output_split,
             exclusion_out=args.output_exclusion,
         )

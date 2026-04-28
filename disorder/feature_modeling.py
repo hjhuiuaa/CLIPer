@@ -7,7 +7,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from cliper.modeling import MLPClassifierHead, TransformerClassifierHead, _build_padding_mask
+from cliper.modeling import CNNClassifierHead, MLPClassifierHead, TransformerClassifierHead, _build_padding_mask
 
 
 class DisorderFeatureClassifier(nn.Module):
@@ -68,6 +68,19 @@ class DisorderFeatureClassifier(nn.Module):
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 activation=str(classifier_cfg.get("activation", "relu")),
                 use_positional_encoding=bool(classifier_cfg.get("use_positional_encoding", True)),
+            )
+        elif head_type == "cnn":
+            self.classifier = CNNClassifierHead(
+                input_dim=hidden_size,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
             )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")

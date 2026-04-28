@@ -140,6 +140,41 @@ def test_load_config_accepts_stage3_transformer_defaults(tmp_path: Path) -> None
     assert loaded["classifier_head"]["use_positional_encoding"] is True
 
 
+def test_load_config_accepts_stage4_cnn_defaults(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {"type": "cnn"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage4_cnn.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["classifier_head"]["type"] == "cnn"
+    assert loaded["classifier_head"]["conv_channels"] == [256, 256, 256]
+    assert loaded["classifier_head"]["kernel_size"] == 3
+    assert loaded["classifier_head"]["dilations"] == [1, 2, 4]
+
+
+def test_load_config_rejects_invalid_cnn_dilations_length(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {"type": "cnn", "conv_channels": [256, 256, 256], "dilations": [1, 2]},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage4_cnn_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dilations"):
+        load_config(config_path)
+
+
 def test_load_config_rejects_invalid_transformer_params(tmp_path: Path) -> None:
     config = _base_config()
     config.update(
@@ -153,6 +188,45 @@ def test_load_config_rejects_invalid_transformer_params(tmp_path: Path) -> None:
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     with pytest.raises(ValueError, match="num_layers"):
+        load_config(config_path)
+
+
+def test_load_config_accepts_stage4_cnn_defaults(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {"type": "cnn"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage4_cnn.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["classifier_head"]["type"] == "cnn"
+    assert loaded["classifier_head"]["conv_channels"] == [256, 256, 256]
+    assert loaded["classifier_head"]["kernel_size"] == 3
+    assert loaded["classifier_head"]["dilations"] == [1, 2, 4]
+
+
+def test_load_config_rejects_invalid_cnn_dilation_length(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {
+                "type": "cnn",
+                "conv_channels": [256, 256, 256],
+                "dilations": [1, 2],
+            },
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage4_cnn_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="dilations"):
         load_config(config_path)
 
 
@@ -170,4 +244,81 @@ def test_stage3_forces_contrastive_disabled_even_if_enabled_in_config(tmp_path: 
 
     loaded = load_config(config_path)
     assert loaded["contrastive"]["enabled"] is False
+    assert loaded["stage_contrastive_forced_off"] is True
     assert loaded["stage3_contrastive_forced_off"] is True
+
+
+def test_load_config_accepts_stage4(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": False},
+        }
+    )
+    config_path = tmp_path / "config_stage4.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["stage"] == "stage4"
+
+
+def test_stage4_forces_contrastive_disabled_even_if_enabled_in_config(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage4",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": True},
+        }
+    )
+    config_path = tmp_path / "config_stage4_force_off.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["contrastive"]["enabled"] is False
+    assert loaded["stage_contrastive_forced_off"] is True
+    assert loaded["stage3_contrastive_forced_off"] is True
+
+
+def test_load_config_accepts_local_context_concat_window(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": False},
+            "local_context": {
+                "enabled": True,
+                "radius": 2,
+                "mode": "concat_window",
+                "include_self": True,
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage3_local_context_ok.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["local_context"]["enabled"] is True
+    assert loaded["local_context"]["radius"] == 2
+    assert loaded["local_context"]["mode"] == "concat_window"
+    assert loaded["local_context"]["include_self"] is True
+
+
+def test_load_config_rejects_invalid_local_context_mode(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage3",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": False},
+            "local_context": {"enabled": True, "radius": 2, "mode": "bad_mode"},
+        }
+    )
+    config_path = tmp_path / "config_stage3_local_context_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="local_context.mode"):
+        load_config(config_path)

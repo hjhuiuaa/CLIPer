@@ -41,8 +41,11 @@ contrastive:
   proj_dim: 128
   max_samples_per_class: 256
 
-train_fasta: /data/huggs/hujh/disorder/disprot_train_label.fasta
-caid_fasta: /data/huggs/hujh/disorder/disprot_holdout.fasta
+# train_fasta: one 3-line FASTA listing every id in split_manifest (train ∪ val). After prepare_split:
+#   cat disorder/data/train_rmSimi_label.fasta disorder/data/val_rmSimi_label.fasta > disorder/data/train_val_labeled.fasta
+train_fasta: disorder/data/train_val_labeled.fasta
+# Holdout: must be 3-line FASTA for CLIPer train(). Use labeled test file if test.fasta is 2-line only.
+caid_fasta: disorder/data/test_label.fasta
 split_manifest: disorder/artifacts/splits/disorder_split_seed42.json
 output_dir: disorder/artifacts/runs/disorder_stage3_mlp5
 experiment_prefix: exp

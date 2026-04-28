@@ -1,0 +1,56 @@
+stage: stage3
+backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
+window_size: 1024
+batch_tokens: 2048
+optimizer: adamw
+lr: 0.0003
+weight_decay: 0.01
+max_epochs: 30
+early_stop_patience: 5
+seed: 42
+threshold_search:
+  min: 0.05
+  max: 0.95
+  step: 0.05
+
+# Optional overrides
+dropout: 0.1
+freeze_backbone: true
+eval_stride: 512
+top_k_heuristic: 4
+num_workers: 0
+device: cuda
+
+# Stage3: validate pure classifier capacity gain (no contrastive loss).
+classifier_head:
+  type: mlp5
+  dropout: 0.3
+  use_layernorm: true
+  activation: relu
+  hidden_dims: [1024, 256, 128, 64]
+
+contrastive:
+  enabled: false
+  weight: 0.2
+  temperature: 0.1
+  proj_dim: 128
+  max_samples_per_class: 256
+
+train_fasta: dataset/disprot_202312_linker_label.fasta
+caid_fasta: dataset/linker.fasta
+split_manifest: artifacts/splits/disprot_split_seed42.json
+output_dir: artifacts/runs/stage3_prostt5_mlp5
+experiment_prefix: exp
+save_every: 500
+print_every: 20
+eval_every: 200
+auto_start_tensorboard: true
+tensorboard_host: 0.0.0.0
+tensorboard_port: 6006
+use_wandb: false
+wandb_entity: 3151599052-nankai-university
+wandb_project: CLIPer
+wandb_mode: online
+wandb_run_name: null
+wandb_group: stage3
+wandb_tags: [stage3, bce, mlp5]
