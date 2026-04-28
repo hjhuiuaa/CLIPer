@@ -347,6 +347,22 @@ Visualization behavior:
 - W&B 相关参数：`use_wandb` / `wandb_entity` / `wandb_project` / `wandb_mode` / `wandb_run_name` / `wandb_group` / `wandb_tags` / `wandb_dir`。
 - 远程端口转发：`scripts/forward_tensorboard.ps1`（Windows）、`scripts/forward_tensorboard.sh`（Linux/macOS/Git Bash）。
 
+## Current Model Comparison (2026-04-28)
+Representative CAID3 results from recent Stage 4 runs (single-run snapshots):
+
+| Model config | CAID3 AUROC | CAID3 AUPRC | CAID3 F1 | CAID3 MCC |
+| --- | ---: | ---: | ---: | ---: |
+| `stage4_prostt5_mlp5_concat_window` | `~0.917` | `~0.501` | `~0.542` | `~0.516` |
+| `stage4_prostt5_transformer_concat_window_stable` | `~0.892` | `~0.488` | `~0.521` | `~0.501` |
+| `stage4_prostt5_cnn_concat_window_t1_regularized` | `~0.926-0.927` | `~0.552-0.569` | `~0.546-0.568` | `~0.513-0.544` |
+
+Current best-performing family in these experiments: **Stage 4 CNN + concat_window**, especially
+`stage4_prostt5_cnn_concat_window_t1_regularized`.
+
+Notes:
+- These are single-run / few-seed observations, not final multi-seed averages.
+- Final model selection should use repeated seeds and report mean/std over the same split.
+
 ## Stage 3 Experiment Plan
 - `E0`: Stage 1 linear head baseline (current best config).
 - `E1`: Stage 3 MLP5 + BCE (primary comparison).
