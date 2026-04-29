@@ -21,12 +21,19 @@ from torch.utils.data import DataLoader, Dataset
 import yaml
 
 from .data import (
+    MotifSpec,
     ProteinRecord,
     build_split_manifest,
+    build_motif_special_tokens,
+    build_motif_token_map,
+    build_motif_vocab,
+    load_motif_specs,
     parse_id_lines,
     parse_three_line_fasta,
     read_json,
     select_records,
+    summarize_motif_coverage,
+    tokenize_sequence_with_motifs,
     write_json,
 )
 from .metrics import (
@@ -37,7 +44,14 @@ from .metrics import (
     precision_recall_auc,
     search_best_threshold,
 )
-from .modeling import ResidueClassifier, encode_sequences, load_backbone_and_tokenizer
+from .modeling import (
+    ResidueClassifier,
+    configure_trainable_token_embeddings,
+    encode_sequences,
+    encode_token_sequences,
+    load_backbone_and_tokenizer,
+    prepare_backbone_for_motif_tokenizer,
+)
 from .windowing import build_eval_window_starts, merge_window_logits, sigmoid, training_crop
 
 
@@ -95,6 +109,7 @@ DEFAULTS = {
     "wandb_group": None,
     "wandb_tags": [],
     "wandb_dir": None,
+    "tokenizer_name": None,
     "classifier_head": {
         "type": "linear",
         "dropout": 0.3,
@@ -114,6 +129,12 @@ DEFAULTS = {
         "radius": 2,
         "mode": "concat_window",
         "include_self": True,
+    },
+    "motif": {
+        "enabled": False,
+        "source": None,
+        "matching": "prosite",
+        "tokenization": "special_token",
     },
     "contrastive": {
         "enabled": False,
@@ -301,6 +322,29 @@ def _resolve_local_context_config(config: dict[str, Any]) -> dict[str, Any]:
     return defaults
 
 
+def _resolve_motif_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = config.get("motif", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("motif must be a dict when provided.")
+    defaults = dict(DEFAULTS["motif"])
+    defaults.update(raw)
+    defaults["enabled"] = bool(defaults.get("enabled", False))
+    defaults["source"] = _optional_str(defaults.get("source"))
+    defaults["matching"] = str(defaults.get("matching", "degenerate")).lower()
+    if defaults["matching"] not in {"exact", "regex", "degenerate", "prosite"}:
+        raise ValueError("motif.matching must be one of ['exact', 'regex', 'degenerate', 'prosite']")
+    defaults["tokenization"] = str(defaults.get("tokenization", "special_token")).lower()
+    if defaults["tokenization"] in {"special", "special_tokens"}:
+        defaults["tokenization"] = "special_token"
+    if defaults["enabled"] and defaults["tokenization"] != "special_token":
+        raise ValueError("motif.tokenization only supports 'special_token'. Legacy fusion has been removed.")
+    if defaults["enabled"] and defaults["source"] is None:
+        raise ValueError("motif.enabled=true requires motif.source to be set.")
+    return defaults
+
+
 def _resolve_wandb_tags(raw: Any) -> list[str]:
     if raw is None:
         return []
@@ -326,6 +370,10 @@ def _optional_str(value: Any) -> str | None:
     return text or None
 
 
+def _resolve_tokenizer_name(config: dict[str, Any]) -> str | None:
+    return _optional_str(config.get("tokenizer_name"))
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     config = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -335,18 +383,25 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     merged.update(config)
     stage = str(merged.get("stage", "stage1")).lower()
-    if stage not in {"stage1", "stage2", "stage3", "stage4"}:
-        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3', 'stage4'], got {stage!r}")
+    if stage not in {"stage1", "stage2", "stage3", "stage4", "stage5"}:
+        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3', 'stage4', 'stage5'], got {stage!r}")
     merged["stage"] = stage
+    merged["tokenizer_name"] = _resolve_tokenizer_name(merged)
     merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
     merged["classifier_head"] = _resolve_classifier_head_config(config)
     merged["local_context"] = _resolve_local_context_config(config)
+    merged["motif"] = _resolve_motif_config(config)
     merged["stage_contrastive_forced_off"] = False
     merged["stage3_contrastive_forced_off"] = False
-    if stage in {"stage3", "stage4"} and bool(merged["contrastive"].get("enabled", False)):
+    if stage in {"stage3", "stage4", "stage5"} and bool(merged["contrastive"].get("enabled", False)):
         merged["contrastive"]["enabled"] = False
         merged["stage_contrastive_forced_off"] = True
         merged["stage3_contrastive_forced_off"] = True
+    if stage == "stage5" and bool(merged["motif"].get("enabled", False)):
+        if merged["backbone_name"].lower() != "dummy" and merged["tokenizer_name"] is None:
+            raise ValueError(
+                "Stage 5 motif special-token mode requires tokenizer_name pointing to a trained PROSITE tokenizer."
+            )
     if merged["optimizer"].lower() != "adamw":
         raise ValueError("Only optimizer=adamw is supported.")
     merged["auto_rebuild_split_on_mismatch"] = bool(merged.get("auto_rebuild_split_on_mismatch", True))
@@ -818,6 +873,62 @@ def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> t
     return labels_tensor
 
 
+def _motif_special_token_batch(
+    sequences: list[str],
+    specs: list[MotifSpec],
+) -> tuple[list[list[str]], list[list[int]]]:
+    token_sequences: list[list[str]] = []
+    token_residue_lengths: list[list[int]] = []
+    token_map = build_motif_token_map(specs)
+    for sequence in sequences:
+        tokens, span_lengths, _ = tokenize_sequence_with_motifs(sequence, specs, token_map=token_map)
+        token_sequences.append(tokens)
+        token_residue_lengths.append(span_lengths)
+    return token_sequences, token_residue_lengths
+
+
+def _encode_batch_sequences(
+    *,
+    tokenizer: Any,
+    backbone_name: str,
+    sequences: list[str],
+    motif_specs: list[MotifSpec] | None,
+    motif_cfg: dict[str, Any] | None,
+):
+    if motif_cfg and bool(motif_cfg.get("enabled", False)) and motif_cfg.get("tokenization") == "special_token":
+        if motif_specs is None:
+            raise RuntimeError("Motif special-token pipeline is enabled but motif specs are missing.")
+        token_sequences, token_residue_lengths = _motif_special_token_batch(sequences, motif_specs)
+        return encode_token_sequences(tokenizer, backbone_name, token_sequences, token_residue_lengths)
+    return encode_sequences(tokenizer, backbone_name, sequences)
+
+
+def _build_motif_runtime_metadata(
+    specs: list[MotifSpec],
+    tokenizer_info: dict[str, Any] | None,
+    motif_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    motif_vocab = {
+        spec.motif_id: {
+            "index": idx + 1,
+            "token": spec.token or build_motif_token_map([spec])[spec.motif_id],
+            "accession": spec.accession,
+            "kind": spec.kind,
+        }
+        for idx, spec in enumerate(specs)
+    }
+    return {
+        "source": motif_cfg.get("source"),
+        "num_motifs": len(specs),
+        "tokenization": motif_cfg.get("tokenization"),
+        "matching": motif_cfg.get("matching"),
+        "alignment_strategy": "greedy_longest_non_overlapping_span_replacement",
+        "logit_restore_strategy": "broadcast_token_output_to_original_residue_span",
+        "tokenizer": tokenizer_info or {},
+        "motif_vocab": motif_vocab,
+    }
+
+
 def _sample_contrastive_residues(
     embeddings: torch.Tensor,
     labels: torch.Tensor,
@@ -928,6 +1039,9 @@ def _batched_forward(
     tokenizer: Any,
     backbone_name: str,
     sequences: list[str],
+    motif_specs: list[MotifSpec] | None,
+    motif_vocab: dict[str, int] | None,
+    motif_cfg: dict[str, Any] | None,
     *,
     device: torch.device,
     batch_size: int,
@@ -936,7 +1050,13 @@ def _batched_forward(
     outputs: list[list[float]] = []
     for start in range(0, len(sequences), batch_size):
         batch_sequences = sequences[start : start + batch_size]
-        encoded = encode_sequences(tokenizer, backbone_name, batch_sequences)
+        encoded = _encode_batch_sequences(
+            tokenizer=tokenizer,
+            backbone_name=backbone_name,
+            sequences=batch_sequences,
+            motif_specs=motif_specs,
+            motif_cfg=motif_cfg,
+        )
         input_ids = encoded.input_ids.to(device)
         attention_mask = encoded.attention_mask.to(device)
         residue_lengths = encoded.residue_lengths
@@ -947,6 +1067,7 @@ def _batched_forward(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     residue_lengths=residue_lengths,
+                    token_residue_lengths=encoded.token_residue_lengths,
                 )
         logits = logits.detach().float().cpu()
         for row, length in enumerate(residue_lengths):
@@ -974,6 +1095,9 @@ def evaluate_records(
     tokenizer: Any,
     backbone_name: str,
     records: list[ProteinRecord],
+    motif_specs: list[MotifSpec] | None,
+    motif_vocab: dict[str, int] | None,
+    motif_cfg: dict[str, Any] | None,
     *,
     window_size: int,
     stride: int | None,
@@ -1002,6 +1126,9 @@ def evaluate_records(
             tokenizer,
             backbone_name,
             windows,
+            motif_specs,
+            motif_vocab,
+            motif_cfg,
             device=device,
             batch_size=batch_size,
             mixed_precision=mixed_precision,
@@ -1085,6 +1212,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     stage = str(config.get("stage", "stage1"))
     classifier_head_cfg = dict(config.get("classifier_head", {}))
     contrastive_cfg = dict(config.get("contrastive", {}))
+    motif_cfg = dict(config.get("motif", {}))
     contrastive_enabled = bool(contrastive_cfg.get("enabled", False))
     contrastive_weight = float(contrastive_cfg.get("weight", 0.0)) if contrastive_enabled else 0.0
     contrastive_temperature = float(contrastive_cfg.get("temperature", 0.1))
@@ -1177,6 +1305,21 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
 
     all_records = parse_three_line_fasta(config["train_fasta"])
     caid_records = parse_three_line_fasta(config["caid_fasta"])
+    motif_specs: list[MotifSpec] | None = None
+    motif_vocab: dict[str, int] | None = None
+    motif_stats: dict[str, Any] | None = None
+    if bool(motif_cfg.get("enabled", False)):
+        motif_specs = load_motif_specs(
+            motif_cfg["source"],
+            matching=str(motif_cfg.get("matching", "degenerate")),
+        )
+        motif_vocab = build_motif_vocab(motif_specs)
+        motif_stats = summarize_motif_coverage(all_records, motif_specs, motif_vocab)
+        log(
+            "[motif] enabled source="
+            f"{motif_cfg['source']} motifs={motif_stats['num_motifs']} "
+            f"coverage={motif_stats['coverage_ratio']:.4f}"
+        )
     train_records, val_records, split_manifest, split_manifest_resolution, rebuilt_exclusion_report = _resolve_train_val_records(
         all_records=all_records,
         caid_records=caid_records,
@@ -1211,7 +1354,26 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
 
     pos_weight, class_stats = _compute_pos_weight(train_records)
 
-    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(config["backbone_name"])
+    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
+        config["backbone_name"],
+        tokenizer_name=config.get("tokenizer_name"),
+    )
+    motif_tokenizer_info: dict[str, Any] | None = None
+    if bool(motif_cfg.get("enabled", False)):
+        if motif_specs is None:
+            raise RuntimeError("Motif specs are missing while motif.enabled=true.")
+        motif_special_tokens = build_motif_special_tokens(motif_specs)
+        motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(backbone, tokenizer, motif_special_tokens)
+        config_resolved["motif_runtime"] = _build_motif_runtime_metadata(
+            motif_specs,
+            motif_tokenizer_info,
+            motif_cfg,
+        )
+        log(
+            "[motif] trained tokenizer special tokens="
+            f"{len(motif_special_tokens)} tokenizer={config.get('tokenizer_name')} "
+            f"strategy={config_resolved['motif_runtime']['alignment_strategy']}"
+        )
     model = ResidueClassifier(
         backbone=backbone,
         hidden_size=hidden_size,
@@ -1220,7 +1382,11 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         projection_dim=int(contrastive_cfg["proj_dim"]),
         classifier_head=classifier_head_cfg,
         local_context=dict(config.get("local_context", {})),
+        motif=motif_cfg,
+        motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
     ).to(device)
+    if motif_tokenizer_info is not None:
+        configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
 
     batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
     train_dataset = TrainDataset(train_records, window_size=int(config["window_size"]), seed=int(config["seed"]))
@@ -1228,12 +1394,19 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     def _collate(batch: list[TrainItem]) -> dict[str, Any]:
         sequences = [item.sequence for item in batch]
         labels = [item.labels for item in batch]
-        encoded = encode_sequences(tokenizer, config["backbone_name"], sequences)
+        encoded = _encode_batch_sequences(
+            tokenizer=tokenizer,
+            backbone_name=config["backbone_name"],
+            sequences=sequences,
+            motif_specs=motif_specs,
+            motif_cfg=motif_cfg,
+        )
         label_tensor = _labels_to_tensor(labels, encoded.residue_lengths)
         return {
             "input_ids": encoded.input_ids,
             "attention_mask": encoded.attention_mask,
             "residue_lengths": encoded.residue_lengths,
+            "token_residue_lengths": encoded.token_residue_lengths,
             "labels": label_tensor,
         }
 
@@ -1324,6 +1497,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         },
         step=global_step,
     )
+    if motif_stats is not None:
+        writer.add_scalar("motif/coverage_ratio", float(motif_stats["coverage_ratio"]), global_step)
+        writer.add_scalar("motif/num_motifs", int(motif_stats["num_motifs"]), global_step)
 
     save_every = int(config["save_every"])
     print_every = int(config["print_every"])
@@ -1355,6 +1531,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             tokenizer,
             config["backbone_name"],
             train_records,
+            motif_specs,
+            motif_vocab,
+            motif_cfg,
             window_size=int(config["window_size"]),
             stride=config["eval_stride"],
             top_k_heuristic=int(config["top_k_heuristic"]),
@@ -1371,6 +1550,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             tokenizer,
             config["backbone_name"],
             val_records,
+            motif_specs,
+            motif_vocab,
+            motif_cfg,
             window_size=int(config["window_size"]),
             stride=config["eval_stride"],
             top_k_heuristic=int(config["top_k_heuristic"]),
@@ -1468,6 +1650,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
                 residue_lengths = batch["residue_lengths"]
+                token_residue_lengths = batch["token_residue_lengths"]
 
                 optimizer.zero_grad(set_to_none=True)
                 with _autocast_context(device_type=device.type, enabled=use_amp):
@@ -1476,10 +1659,16 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                             input_ids=input_ids,
                             attention_mask=attention_mask,
                             residue_lengths=residue_lengths,
+                            token_residue_lengths=token_residue_lengths,
                             return_embeddings=True,
                         )
                     else:
-                        logits = model(input_ids=input_ids, attention_mask=attention_mask, residue_lengths=residue_lengths)
+                        logits = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            residue_lengths=residue_lengths,
+                            token_residue_lengths=token_residue_lengths,
+                        )
                         residue_embeddings = None
                     mask = labels >= 0
                     valid_count = int(mask.sum().item())
@@ -1718,6 +1907,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         tokenizer,
         config["backbone_name"],
         caid_records,
+        motif_specs,
+        motif_vocab,
+        motif_cfg,
         window_size=int(config["window_size"]),
         stride=config["eval_stride"],
         top_k_heuristic=int(config["top_k_heuristic"]),
@@ -1799,6 +1991,8 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             "pos_weight": pos_weight,
             "stage": stage,
             "contrastive": contrastive_cfg,
+            "motif": motif_cfg,
+            "motif_stats": motif_stats,
             "global_steps": global_step,
             "save_every": save_every,
             "print_every": print_every,
@@ -1834,6 +2028,8 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         "best_val_auroc": best_auroc,
         "stage": stage,
         "contrastive": contrastive_cfg,
+        "motif": motif_cfg,
+        "motif_stats": motif_stats,
         "caid3_metrics": caid_eval["metrics"],
     }
 
@@ -1908,8 +2104,29 @@ def evaluate(
         records = select_records(records, manifest[split_key])
 
     classifier_head_cfg = _resolve_classifier_head_config(config)
+    motif_cfg = _resolve_motif_config(config)
+    motif_specs: list[MotifSpec] | None = None
+    motif_vocab: dict[str, int] | None = None
+    if bool(motif_cfg.get("enabled", False)):
+        motif_specs = load_motif_specs(
+            motif_cfg["source"],
+            matching=str(motif_cfg.get("matching", "degenerate")),
+        )
+        motif_vocab = build_motif_vocab(motif_specs)
 
-    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(config["backbone_name"])
+    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
+        config["backbone_name"],
+        tokenizer_name=config.get("tokenizer_name"),
+    )
+    motif_tokenizer_info: dict[str, Any] | None = None
+    if bool(motif_cfg.get("enabled", False)):
+        if motif_specs is None:
+            raise RuntimeError("Motif specs are missing while motif.enabled=true.")
+        motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(
+            backbone,
+            tokenizer,
+            build_motif_special_tokens(motif_specs),
+        )
     model = ResidueClassifier(
         backbone=backbone,
         hidden_size=hidden_size,
@@ -1918,7 +2135,11 @@ def evaluate(
         projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
         classifier_head=classifier_head_cfg,
         local_context=dict(config.get("local_context", {})),
+        motif=motif_cfg,
+        motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
     )
+    if motif_tokenizer_info is not None:
+        configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
     _load_model_state(model, checkpoint["model_state"], logger=log)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
@@ -1929,6 +2150,9 @@ def evaluate(
         tokenizer,
         config["backbone_name"],
         records,
+        motif_specs,
+        motif_vocab,
+        motif_cfg,
         window_size=int(config["window_size"]),
         stride=config.get("eval_stride"),
         top_k_heuristic=int(config.get("top_k_heuristic", 4)),
@@ -1968,6 +2192,7 @@ def evaluate(
             "split_key": split_key,
             "threshold": resolved_threshold,
             "batch_size": batch_size,
+            "motif": motif_cfg,
         },
     )
     log(

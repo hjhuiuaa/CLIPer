@@ -16,21 +16,51 @@ class EncodedBatch:
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
     residue_lengths: list[int]
+    token_residue_lengths: list[list[int]] | None = None
 
 
 class DummyProteinTokenizer:
     def __init__(self) -> None:
         alphabet = "ACDEFGHIKLMNPQRSTVWYX-"
+        self.is_dummy_tokenizer = True
         self.pad_token_id = 0
         self.eos_token_id = 1
         self._vocab = {aa: idx + 2 for idx, aa in enumerate(alphabet)}
 
-    def __call__(self, sequences: list[str]) -> EncodedBatch:
-        residue_lengths = [len(seq) for seq in sequences]
+    def __len__(self) -> int:
+        return max(self._vocab.values(), default=self.eos_token_id) + 1
+
+    def add_special_tokens(self, payload: dict[str, list[str]]) -> int:
+        added = 0
+        for token in payload.get("additional_special_tokens", []):
+            if token in self._vocab:
+                continue
+            self._vocab[token] = len(self)
+            added += 1
+        return added
+
+    def get_vocab(self) -> dict[str, int]:
+        return dict(self._vocab)
+
+    def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]:
+        if isinstance(tokens, str):
+            return self._vocab.get(tokens, self._vocab["X"])
+        return [self.convert_tokens_to_ids(token) for token in tokens]
+
+    def __call__(self, sequences: list[str] | list[list[str]]) -> EncodedBatch:
+        token_sequences: list[list[str]] = []
+        residue_lengths: list[int] = []
+        for sequence in sequences:
+            if isinstance(sequence, list):
+                tokens = sequence
+            else:
+                tokens = list(sequence)
+            token_sequences.append(tokens)
+            residue_lengths.append(len(tokens))
         tokenized = []
         max_len = 0
-        for sequence in sequences:
-            ids = [self._vocab.get(ch, self._vocab["X"]) for ch in sequence]
+        for tokens in token_sequences:
+            ids = [self._vocab.get(token, self._vocab["X"]) for token in tokens]
             ids.append(self.eos_token_id)
             tokenized.append(ids)
             max_len = max(max_len, len(ids))
@@ -56,6 +86,22 @@ class DummyBackbone(nn.Module):
         if attention_mask is not None:
             outputs = outputs * attention_mask.unsqueeze(-1).to(outputs.dtype)
         return SimpleNamespace(last_hidden_state=outputs)
+
+    def resize_token_embeddings(self, new_size: int) -> nn.Embedding:
+        old_embedding = self.embedding
+        if new_size == old_embedding.num_embeddings:
+            return old_embedding
+        new_embedding = nn.Embedding(new_size, old_embedding.embedding_dim)
+        copy_rows = min(old_embedding.num_embeddings, new_size)
+        with torch.no_grad():
+            new_embedding.weight[:copy_rows] = old_embedding.weight[:copy_rows]
+            if new_size > copy_rows:
+                nn.init.normal_(new_embedding.weight[copy_rows:], mean=0.0, std=0.02)
+        self.embedding = new_embedding
+        return self.embedding
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embedding
 
 
 def _build_activation(name: str) -> nn.Module:
@@ -114,6 +160,110 @@ def _resolve_local_context(local_context: dict[str, Any] | None) -> dict[str, An
         "mode": mode,
         "include_self": include_self,
     }
+
+
+def _resolve_motif_config(motif: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(motif or {})
+    enabled = bool(cfg.get("enabled", False))
+    tokenization = str(cfg.get("tokenization", "special_token")).lower()
+    if tokenization in {"special", "special_tokens"}:
+        tokenization = "special_token"
+    if enabled and tokenization != "special_token":
+        raise ValueError("motif.tokenization only supports 'special_token'. Legacy fusion has been removed.")
+    return {
+        "enabled": enabled,
+        "tokenization": tokenization,
+    }
+
+
+def prepare_backbone_for_motif_tokenizer(
+    backbone: nn.Module,
+    tokenizer: Any,
+    special_tokens: list[str],
+) -> dict[str, Any]:
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    missing = [token for token in special_tokens if token not in vocab]
+    if missing:
+        if bool(getattr(tokenizer, "is_dummy_tokenizer", False)):
+            tokenizer.add_special_tokens({"additional_special_tokens": missing})
+            vocab = tokenizer.get_vocab()
+            missing = [token for token in special_tokens if token not in vocab]
+        if missing:
+            raise ValueError(
+                "Trained tokenizer is missing motif special tokens. "
+                f"Missing sample: {missing[:10]}"
+            )
+    if not hasattr(tokenizer, "convert_tokens_to_ids"):
+        raise ValueError("Tokenizer does not support convert_tokens_to_ids.")
+    token_ids = tokenizer.convert_tokens_to_ids(list(special_tokens))
+    if not hasattr(backbone, "resize_token_embeddings"):
+        raise ValueError("Backbone does not support resize_token_embeddings for motif tokenizer.")
+    embedding = backbone.resize_token_embeddings(len(tokenizer))
+    return {
+        "tokens": list(special_tokens),
+        "token_ids": [int(token_id) for token_id in token_ids],
+        "added_count": 0,
+        "tokenizer_length": len(tokenizer),
+        "embedding_rows": int(embedding.num_embeddings),
+    }
+
+
+def configure_trainable_token_embeddings(backbone: nn.Module, token_ids: list[int]) -> None:
+    if not token_ids:
+        return
+    if not hasattr(backbone, "get_input_embeddings"):
+        raise ValueError("Backbone does not expose get_input_embeddings.")
+    embedding = backbone.get_input_embeddings()
+    if embedding is None or not hasattr(embedding, "weight"):
+        raise ValueError("Backbone input embeddings are unavailable.")
+    unique_ids = sorted({int(token_id) for token_id in token_ids})
+    embedding.weight.requires_grad = True
+
+    def _mask_old_token_grads(grad: torch.Tensor) -> torch.Tensor:
+        mask = torch.zeros((grad.shape[0], 1), dtype=grad.dtype, device=grad.device)
+        valid_ids = [token_id for token_id in unique_ids if 0 <= token_id < grad.shape[0]]
+        if valid_ids:
+            mask[torch.tensor(valid_ids, dtype=torch.long, device=grad.device)] = 1
+        return grad * mask
+
+    embedding.weight.register_hook(_mask_old_token_grads)
+
+
+def _broadcast_token_hidden_to_residues(
+    token_hidden: torch.Tensor,
+    token_residue_lengths: list[list[int]],
+    residue_lengths: list[int],
+) -> torch.Tensor:
+    batch_size, token_count, hidden_size = token_hidden.shape
+    if len(token_residue_lengths) != batch_size:
+        raise ValueError(
+            "token_residue_lengths batch size mismatch: "
+            f"{len(token_residue_lengths)} vs hidden batch {batch_size}"
+        )
+    max_residue_len = max(residue_lengths)
+    residue_hidden = token_hidden.new_zeros((batch_size, max_residue_len, hidden_size))
+    for row, (span_lengths, residue_len) in enumerate(zip(token_residue_lengths, residue_lengths)):
+        cursor = 0
+        if len(span_lengths) > token_count:
+            raise ValueError(
+                f"token_residue_lengths[{row}] has {len(span_lengths)} tokens but backbone returned {token_count}."
+            )
+        for token_idx, raw_span_len in enumerate(span_lengths):
+            span_len = int(raw_span_len)
+            if span_len <= 0:
+                raise ValueError(f"token span lengths must be positive, got {span_len} at row={row} token={token_idx}")
+            end = min(cursor + span_len, residue_len)
+            if end > cursor:
+                residue_hidden[row, cursor:end, :] = token_hidden[row, token_idx, :]
+            cursor = end
+            if cursor >= residue_len:
+                break
+        if cursor != residue_len:
+            raise ValueError(
+                f"Token-to-residue alignment did not cover sequence row={row}: "
+                f"covered={cursor} residue_len={residue_len} span_lengths={span_lengths!r}"
+            )
+    return residue_hidden
 
 
 def _local_context_multiplier(local_context: dict[str, Any]) -> int:
@@ -315,12 +465,18 @@ class ResidueClassifier(nn.Module):
         projection_dim: int = 128,
         classifier_head: dict[str, Any] | None = None,
         local_context: dict[str, Any] | None = None,
+        motif: dict[str, Any] | None = None,
+        motif_vocab_size: int = 0,
     ):
         super().__init__()
         self.backbone = backbone
         self.freeze_backbone = freeze_backbone
         self.dropout = nn.Dropout(dropout)
         self.local_context = _resolve_local_context(local_context)
+        self.motif = _resolve_motif_config(motif)
+        self.motif_enabled = bool(self.motif.get("enabled", False))
+        self.motif_tokenization = str(self.motif.get("tokenization", "special_token"))
+        self.motif_vocab_size = int(max(0, motif_vocab_size))
         classifier_input_dim = hidden_size * _local_context_multiplier(self.local_context)
 
         classifier_cfg = dict(classifier_head or {})
@@ -402,10 +558,13 @@ class ResidueClassifier(nn.Module):
         attention_mask: torch.Tensor,
         residue_lengths: list[int],
         *,
+        token_residue_lengths: list[list[int]] | None = None,
         return_embeddings: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        keep_backbone_graph = self.motif_enabled and token_residue_lengths is not None
         if self.freeze_backbone:
             self.backbone.eval()
+        if self.freeze_backbone and not keep_backbone_graph:
             with torch.no_grad():
                 outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         else:
@@ -413,11 +572,14 @@ class ResidueClassifier(nn.Module):
 
         hidden = outputs.last_hidden_state
         max_len = max(residue_lengths)
-        if hidden.shape[1] < max_len:
+        if token_residue_lengths is not None:
+            residue_hidden = _broadcast_token_hidden_to_residues(hidden, token_residue_lengths, residue_lengths)
+        elif hidden.shape[1] < max_len:
             raise ValueError(
                 f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
             )
-        residue_hidden = hidden[:, :max_len, :]
+        else:
+            residue_hidden = hidden[:, :max_len, :]
         contextual_hidden = _concat_local_window(residue_hidden, residue_lengths, self.local_context)
         classifier_input = self.dropout(contextual_hidden)
         if self.classifier_type == "transformer":
@@ -442,7 +604,7 @@ def _resolve_hidden_size(backbone: nn.Module) -> int:
     raise ValueError("Cannot infer hidden size from backbone config.")
 
 
-def load_backbone_and_tokenizer(backbone_name: str) -> tuple[nn.Module, Any, int]:
+def load_backbone_and_tokenizer(backbone_name: str, tokenizer_name: str | None = None) -> tuple[nn.Module, Any, int]:
     if backbone_name.lower() == "dummy":
         tokenizer = DummyProteinTokenizer()
         backbone = DummyBackbone()
@@ -456,7 +618,8 @@ def load_backbone_and_tokenizer(backbone_name: str) -> tuple[nn.Module, Any, int
             "transformers is required for non-dummy backbones. Install dependencies before training/evaluation."
         ) from exc
 
-    tokenizer = AutoTokenizer.from_pretrained(backbone_name, do_lower_case=False)
+    tokenizer_source = tokenizer_name or backbone_name
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, do_lower_case=False)
     config = AutoConfig.from_pretrained(backbone_name)
     if getattr(config, "model_type", None) == "t5":
         backbone = T5EncoderModel.from_pretrained(backbone_name)
@@ -505,3 +668,56 @@ def encode_sequences(tokenizer: Any, backbone_name: str, sequences: list[str]) -
         residue_lengths=residue_lengths,
     )
 
+
+def encode_token_sequences(
+    tokenizer: Any,
+    backbone_name: str,
+    token_sequences: list[list[str]],
+    token_residue_lengths: list[list[int]],
+) -> EncodedBatch:
+    if len(token_sequences) != len(token_residue_lengths):
+        raise ValueError(
+            "token_sequences/token_residue_lengths batch size mismatch: "
+            f"{len(token_sequences)} vs {len(token_residue_lengths)}"
+        )
+    residue_lengths = [sum(int(span_len) for span_len in spans) for spans in token_residue_lengths]
+    for idx, (tokens, spans) in enumerate(zip(token_sequences, token_residue_lengths)):
+        if len(tokens) != len(spans):
+            raise ValueError(
+                f"Token alignment mismatch for sample {idx}: tokens={len(tokens)} spans={len(spans)}"
+            )
+        if any(int(span_len) <= 0 for span_len in spans):
+            raise ValueError(f"All token residue spans must be positive for sample {idx}: {spans!r}")
+
+    if backbone_name.lower() == "dummy":
+        encoded = tokenizer(token_sequences)
+        return EncodedBatch(
+            input_ids=encoded.input_ids,
+            attention_mask=encoded.attention_mask,
+            residue_lengths=residue_lengths,
+            token_residue_lengths=token_residue_lengths,
+        )
+
+    spaced = [" ".join(tokens) for tokens in token_sequences]
+    encoded = tokenizer(
+        spaced,
+        add_special_tokens=True,
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+    )
+    token_counts = [len(tokens) for tokens in token_sequences]
+    for idx, expected_tokens in enumerate(token_counts):
+        actual_tokens = int(encoded["attention_mask"][idx].sum().item())
+        # ProstT5-style tokenizers append EOS, so actual count should normally be expected + 1.
+        if actual_tokens < expected_tokens:
+            raise ValueError(
+                f"Tokenizer produced fewer tokens than motif-tokenized input for sample {idx}: "
+                f"actual={actual_tokens} expected_at_least={expected_tokens}"
+            )
+    return EncodedBatch(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        residue_lengths=residue_lengths,
+        token_residue_lengths=token_residue_lengths,
+    )

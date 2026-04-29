@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output JSON path for exclusion report.",
     )
 
-    train_parser = subparsers.add_parser("train", help="Train CLIPer residue classifier (Stage 1/2/3).")
+    train_parser = subparsers.add_parser("train", help="Train CLIPer residue classifier (Stage 1/2/3/4/5).")
     train_parser.add_argument("--config", required=True, help="YAML config path.")
     train_parser.add_argument(
         "--resume-checkpoint",

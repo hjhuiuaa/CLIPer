@@ -27,6 +27,12 @@ Stage 4 extends Stage 3 with local residue-context concatenation and alternative
 - **Head options:** `mlp3` / `mlp5` / `mlp12` / `transformer` / `cnn`
 - **CNN head:** `conv_channels + dilations` Conv1d stack for residue-wise logits
 
+Stage 5 extends Stage 4 with native PROSITE motif special tokens:
+- **Objective:** `BCEWithLogitsLoss` only (contrastive forced off, same as Stage 3/4)
+- **Backbone policy:** reuse ProstT5 encoder with a saved tokenizer extended from the base tokenizer
+- **Motif source:** all `PATTERN` entries from `prosite.dat`; `MATRIX` entries are ignored
+- **Alignment:** greedy longest-match span replacement, then broadcast token outputs back to residue-level logits
+
 ## Stage 1 Pipeline
 The implementation includes:
 - strict 3-line FASTA parsing (`>id`, sequence, label string)
@@ -98,6 +104,42 @@ python -m cliper.cli train --config configs/stage3_prostt5_transformer.yaml
 python -m cliper.cli train --config configs/stage4_prostt5_cnn_concat_window.yaml
 ```
 
+### 2g) Build Stage 5 PROSITE motif library and tokenizer
+```bash
+python scripts/build_motif_library_from_profile.py \
+  --prosite-dat prosite.dat \
+  --out-json configs/prosite_motif_library_full.json
+
+python scripts/train_prosite_tokenizer.py \
+  --base-tokenizer /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5 \
+  --motif-json configs/prosite_motif_library_full.json \
+  --out-dir configs/prosite_tokenizer
+```
+
+### 2h) Train Stage 5 model (PROSITE special tokens)
+```bash
+python -m cliper.cli train --config configs/stage5_prostt5_motif.yaml
+```
+
+### 2i) Prepare Stage 5 motif data pack (seed + coverage reports)
+```bash
+python scripts/prepare_motif_data_pack.py \
+  --motif-json configs/prosite_motif_library_full.json \
+  --matching prosite \
+  --train-fasta dataset/disprot_202312_linker_label.fasta \
+  --caid-fasta dataset/linker.fasta \
+  --split-manifest artifacts/splits/disprot_split_seed42.json \
+  --out-dir artifacts/motif \
+  --max-per-residue 1 \
+  --top-k 10
+```
+
+Outputs:
+- `artifacts/motif/motif_coverage_summary.json`
+- `artifacts/motif/motif_coverage_train.json`
+- `artifacts/motif/motif_coverage_val.json`
+- `artifacts/motif/motif_coverage_caid.json`
+
 Stage 2 configuration keys:
 - `stage: stage2`
 - `contrastive.enabled`
@@ -136,9 +178,21 @@ Stage 4 additional configuration keys:
 - `classifier_head.kernel_size` (cnn, odd integer)
 - `classifier_head.dilations` (cnn; length must match `conv_channels`)
 
+Stage 5 additional configuration keys:
+- `stage: stage5`
+- `tokenizer_name` (saved tokenizer extended from the base ProstT5 tokenizer)
+- `motif.enabled`
+- `motif.source` (PROSITE motif JSON with `motifs: [{id, ac, de, pa, token}]`)
+- `motif.matching: prosite`
+- `motif.tokenization: special_token`
+
 Stage 3/4 runtime behavior:
 - If `stage: stage3` or `stage: stage4` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
 - Stage 3/4 loss remains pure BCE (`BCEWithLogitsLoss`) for controlled architecture-only validation.
+
+Stage 5 runtime behavior:
+- If `stage: stage5` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
+- Stage 5 keeps pure BCE and trains motif special-token embeddings plus the classifier head while preserving residue-level labels and metrics.
 
 W&B（Weights & Biases）配置（按每次实验 YAML 生效参数记录）：
 - `use_wandb`
@@ -247,6 +301,14 @@ Visualization behavior:
 - Stage 4 (CNN + concat_window) config template: [`configs/stage4_prostt5_cnn_concat_window.yaml`](configs/stage4_prostt5_cnn_concat_window.yaml).
 - Stage 4 (CNN T1 regularized) config template: [`configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml`](configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml).
 - Stage 4 (CNN T3 balanced) config template: [`configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml`](configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml).
+- Stage 5 PROSITE special-token config template: [`configs/stage5_prostt5_motif.yaml`](configs/stage5_prostt5_motif.yaml).
+- Stage 5 PROSITE motif library: `configs/prosite_motif_library_full.json`.
+- Stage 5 PROSITE tokenizer artifact: `configs/prosite_tokenizer/`.
+- Stage 5 seed motif library: [`configs/motif_library_seed_stage5.json`](configs/motif_library_seed_stage5.json).
+- Motif library minimal example: [`configs/motif_library_example.json`](configs/motif_library_example.json).
+- Motif data-pack generator script: [`scripts/prepare_motif_data_pack.py`](scripts/prepare_motif_data_pack.py).
+- PROSITE motif-library builder from `prosite.dat`: [`scripts/build_motif_library_from_profile.py`](scripts/build_motif_library_from_profile.py).
+- PROSITE tokenizer builder: [`scripts/train_prosite_tokenizer.py`](scripts/train_prosite_tokenizer.py).
 - For local tests without downloading a backbone, use `backbone_name: dummy` in config.
 - `save_every` / `print_every` / `eval_every` 默认单位是训练 step（global step）。
 - TensorBoard 自动启动相关参数：`auto_start_tensorboard` / `tensorboard_host` / `tensorboard_port`。
@@ -261,3 +323,11 @@ Visualization behavior:
 - `E4`: Stage 3 MLP12 + BCE (deeper-head comparison against E1).
 - `E5`: Stage 3 Transformer + BCE (attention head comparison against E1/E4).
 - Selection rule: choose the checkpoint with highest validation AUPRC; if gain `< 0.005`, move to class-balanced focal loss (still without contrastive learning).
+
+## Stage 5 Experiment Plan
+- `M0`: Stage 4 best checkpoint/config baseline.
+- `M1`: Stage 5 PROSITE special-token primary run.
+- `M2`: Stage 5 PROSITE special-token with local-context radius sweep.
+- `M3`: Stage 5 PROSITE special-token without local context (`local_context.enabled=false`) for interaction ablation.
+- `M4`: Optional adapter/LoRA backbone ablation if new-token-only training underfits.
+- Selection rule: prefer the model with best validation AUPRC, and report paired AUROC/F1/MCC on CAID3.

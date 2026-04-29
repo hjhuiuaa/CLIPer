@@ -264,6 +264,49 @@ def test_load_config_accepts_stage4(tmp_path: Path) -> None:
     assert loaded["stage"] == "stage4"
 
 
+def test_load_config_accepts_stage5_motif_defaults(tmp_path: Path) -> None:
+    motif_path = tmp_path / "motifs.json"
+    motif_path.write_text('{"motifs":[{"id":"M1","pattern":"P..P"}]}', encoding="utf-8")
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage5",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": False},
+            "motif": {
+                "enabled": True,
+                "source": str(motif_path),
+                "matching": "regex",
+                "tokenization": "special_token",
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage5.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["stage"] == "stage5"
+    assert loaded["motif"]["enabled"] is True
+    assert loaded["motif"]["tokenization"] == "special_token"
+
+
+def test_load_config_rejects_stage5_motif_missing_source(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage5",
+            "classifier_head": {"type": "mlp5"},
+            "contrastive": {"enabled": False},
+            "motif": {"enabled": True},
+        }
+    )
+    config_path = tmp_path / "config_stage5_bad.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="motif.source"):
+        load_config(config_path)
+
+
 def test_stage4_forces_contrastive_disabled_even_if_enabled_in_config(tmp_path: Path) -> None:
     config = _base_config()
     config.update(
