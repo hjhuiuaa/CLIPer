@@ -4,8 +4,8 @@ tokenizer_name: configs/prosite_tokenizer
 window_size: 1024
 batch_tokens: 2048
 optimizer: adamw
-lr: 0.00012
-weight_decay: 0.02
+lr: 0.0002
+weight_decay: 0.01
 max_epochs: 30
 early_stop_patience: 6
 seed: 42
@@ -23,15 +23,15 @@ device: cuda
 
 local_context:
   enabled: true
-  radius: 1
+  radius: 2
   mode: concat_window
   include_self: true
 
 classifier_head:
   type: cnn
-  dropout: 0.30
+  dropout: 0.25
   activation: relu
-  conv_channels: [256, 256, 256]
+  conv_channels: [128, 64, 32]
   kernel_size: 3
   dilations: [1, 2, 4]
 

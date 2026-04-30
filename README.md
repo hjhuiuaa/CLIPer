@@ -33,6 +33,12 @@ Stage 5 extends Stage 4 with native PROSITE motif special tokens:
 - **Motif source:** all `PATTERN` entries from `prosite.dat`; `MATRIX` entries are ignored
 - **Alignment:** greedy longest-match span replacement, then broadcast token outputs back to residue-level logits
 
+Stage 6 fuses ordinary ProstT5 tokenization with PROSITE special-token tokenization:
+- **Objective:** two-branch weighted BCE, `0.5 * plain_bce + 0.5 * special_token_bce`
+- **Backbone policy:** two independent ProstT5 encoder/classifier branches in one checkpoint
+- **Fusion:** validation, CAID3, and `eval` use `0.5 * plain_logits + 0.5 * special_logits`
+- **Default base:** Stage 4 T1 regularized CNN/local-context hyperparameters, plus Stage 5 PROSITE tokenizer assets
+
 ## Stage 1 Pipeline
 The implementation includes:
 - strict 3-line FASTA parsing (`>id`, sequence, label string)
@@ -121,7 +127,12 @@ python scripts/train_prosite_tokenizer.py \
 python -m cliper.cli train --config configs/stage5_prostt5_motif.yaml
 ```
 
-### 2i) Prepare Stage 5 motif data pack (seed + coverage reports)
+### 2i) Train Stage 6 model (dual tokenizer weighted-logit fusion)
+```bash
+python -m cliper.cli train --config configs/stage6_prostt5_dual_tokenizer.yaml
+```
+
+### 2j) Prepare Stage 5/6 motif data pack (seed + coverage reports)
 ```bash
 python scripts/prepare_motif_data_pack.py \
   --motif-json configs/prosite_motif_library_full.json \
@@ -186,6 +197,19 @@ Stage 5 additional configuration keys:
 - `motif.matching: prosite`
 - `motif.tokenization: special_token`
 
+Stage 6 additional configuration keys:
+- `stage: stage6`
+- `dual_tokenizer.enabled: true`
+- `dual_tokenizer.fusion: weighted_logits`
+- `dual_tokenizer.branches.plain.weight: 0.5`
+- `dual_tokenizer.branches.plain.motif.enabled: false`
+- `dual_tokenizer.branches.special.weight: 0.5`
+- `dual_tokenizer.branches.special.tokenizer_name` (saved PROSITE tokenizer, e.g. `configs/prosite_tokenizer`)
+- `dual_tokenizer.branches.special.motif.enabled: true`
+- `dual_tokenizer.branches.special.motif.source`
+- `dual_tokenizer.branches.special.motif.matching: prosite`
+- `dual_tokenizer.branches.special.motif.tokenization: special_token`
+
 Stage 3/4 runtime behavior:
 - If `stage: stage3` or `stage: stage4` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
 - Stage 3/4 loss remains pure BCE (`BCEWithLogitsLoss`) for controlled architecture-only validation.
@@ -193,6 +217,13 @@ Stage 3/4 runtime behavior:
 Stage 5 runtime behavior:
 - If `stage: stage5` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
 - Stage 5 keeps pure BCE and trains motif special-token embeddings plus the classifier head while preserving residue-level labels and metrics.
+
+Stage 6 runtime behavior:
+- If `stage: stage6` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
+- Each batch is encoded twice: once with ordinary residue tokenization, once with motif span replacement and PROSITE special tokens.
+- The two branches keep independent backbone/head parameters; checkpoints store both branches in one model state.
+- Training logs include `train/loss_plain_bce`, `train/loss_special_bce`, and `train/loss_fused_total`.
+- Validation, CAID3, and standalone `eval` write the same prediction format as earlier stages, using weighted fused logits.
 
 W&B（Weights & Biases）配置（按每次实验 YAML 生效参数记录）：
 - `use_wandb`
@@ -302,6 +333,7 @@ Visualization behavior:
 - Stage 4 (CNN T1 regularized) config template: [`configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml`](configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml).
 - Stage 4 (CNN T3 balanced) config template: [`configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml`](configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml).
 - Stage 5 PROSITE special-token config template: [`configs/stage5_prostt5_motif.yaml`](configs/stage5_prostt5_motif.yaml).
+- Stage 6 dual-tokenizer fusion config template: [`configs/stage6_prostt5_dual_tokenizer.yaml`](configs/stage6_prostt5_dual_tokenizer.yaml).
 - Stage 5 PROSITE motif library: `configs/prosite_motif_library_full.json`.
 - Stage 5 PROSITE tokenizer artifact: `configs/prosite_tokenizer/`.
 - Stage 5 seed motif library: [`configs/motif_library_seed_stage5.json`](configs/motif_library_seed_stage5.json).
@@ -331,3 +363,10 @@ Visualization behavior:
 - `M3`: Stage 5 PROSITE special-token without local context (`local_context.enabled=false`) for interaction ablation.
 - `M4`: Optional adapter/LoRA backbone ablation if new-token-only training underfits.
 - Selection rule: prefer the model with best validation AUPRC, and report paired AUROC/F1/MCC on CAID3.
+
+## Stage 6 Experiment Plan
+- `D0`: Stage 4 T1 regularized CNN baseline.
+- `D1`: Stage 5 PROSITE special-token baseline.
+- `D2`: Stage 6 dual-tokenizer `0.5 / 0.5` weighted-logit fusion primary run.
+- `D3`: Optional branch-weight ablation after D2, e.g. `0.25 / 0.75` and `0.75 / 0.25`, only if D2 beats both single-branch baselines.
+- Selection rule: prefer validation AUPRC, then report CAID3 AUPRC/AUROC/F1/MCC using the fused logits from the best checkpoint.

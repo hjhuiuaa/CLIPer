@@ -45,6 +45,7 @@ from .metrics import (
     search_best_threshold,
 )
 from .modeling import (
+    DualTokenizerResidueClassifier,
     ResidueClassifier,
     configure_trainable_token_embeddings,
     encode_sequences,
@@ -142,6 +143,32 @@ DEFAULTS = {
         "temperature": 0.1,
         "proj_dim": 128,
         "max_samples_per_class": 256,
+    },
+    "dual_tokenizer": {
+        "enabled": False,
+        "fusion": "weighted_logits",
+        "branches": {
+            "plain": {
+                "weight": 0.5,
+                "tokenizer_name": None,
+                "motif": {
+                    "enabled": False,
+                    "source": None,
+                    "matching": "prosite",
+                    "tokenization": "special_token",
+                },
+            },
+            "special": {
+                "weight": 0.5,
+                "tokenizer_name": None,
+                "motif": {
+                    "enabled": True,
+                    "source": None,
+                    "matching": "prosite",
+                    "tokenization": "special_token",
+                },
+            },
+        },
     },
 }
 
@@ -374,6 +401,82 @@ def _resolve_tokenizer_name(config: dict[str, Any]) -> str | None:
     return _optional_str(config.get("tokenizer_name"))
 
 
+def _resolve_dual_tokenizer_branch(
+    *,
+    name: str,
+    raw: Any,
+    default: dict[str, Any],
+) -> dict[str, Any]:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"dual_tokenizer.branches.{name} must be a dict.")
+    merged = dict(default)
+    merged.update(raw)
+    weight = float(merged.get("weight", 0.0))
+    if weight < 0.0:
+        raise ValueError(f"dual_tokenizer.branches.{name}.weight must be >= 0, got {weight}")
+    merged["weight"] = weight
+    merged["tokenizer_name"] = _optional_str(merged.get("tokenizer_name"))
+    merged["motif"] = _resolve_motif_config({"motif": merged.get("motif", default.get("motif", {}))})
+    return merged
+
+
+def _resolve_dual_tokenizer_config(config: dict[str, Any], *, stage: str) -> dict[str, Any]:
+    raw = config.get("dual_tokenizer", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("dual_tokenizer must be a dict when provided.")
+    defaults = DEFAULTS["dual_tokenizer"]
+    resolved = {
+        "enabled": bool(raw.get("enabled", stage == "stage6")),
+        "fusion": str(raw.get("fusion", defaults["fusion"])).lower(),
+    }
+    if resolved["fusion"] != "weighted_logits":
+        raise ValueError("dual_tokenizer.fusion only supports 'weighted_logits'.")
+
+    raw_branches = raw.get("branches", {})
+    if raw_branches is None:
+        raw_branches = {}
+    if not isinstance(raw_branches, dict):
+        raise ValueError("dual_tokenizer.branches must be a dict.")
+    default_branches = {
+        "plain": dict(defaults["branches"]["plain"]),
+        "special": dict(defaults["branches"]["special"]),
+    }
+    if stage != "stage6":
+        default_branches["special"] = dict(default_branches["special"])
+        default_branches["special"]["motif"] = dict(default_branches["special"]["motif"])
+        default_branches["special"]["motif"]["enabled"] = False
+    branches = {
+        "plain": _resolve_dual_tokenizer_branch(
+            name="plain",
+            raw=raw_branches.get("plain", {}),
+            default=default_branches["plain"],
+        ),
+        "special": _resolve_dual_tokenizer_branch(
+            name="special",
+            raw=raw_branches.get("special", {}),
+            default=default_branches["special"],
+        ),
+    }
+    total_weight = branches["plain"]["weight"] + branches["special"]["weight"]
+    if abs(total_weight - 1.0) > 1e-6:
+        raise ValueError(f"dual_tokenizer branch weights must sum to 1.0, got {total_weight}")
+    if branches["plain"]["motif"]["enabled"]:
+        raise ValueError("dual_tokenizer.branches.plain.motif.enabled must be false.")
+    if stage == "stage6":
+        if not resolved["enabled"]:
+            raise ValueError("stage6 requires dual_tokenizer.enabled=true.")
+        if not branches["special"]["motif"]["enabled"]:
+            raise ValueError("stage6 requires dual_tokenizer.branches.special.motif.enabled=true.")
+        if str(config.get("backbone_name", "")).lower() != "dummy" and branches["special"]["tokenizer_name"] is None:
+            raise ValueError("Stage 6 special-token branch requires tokenizer_name pointing to a trained PROSITE tokenizer.")
+    resolved["branches"] = branches
+    return resolved
+
+
 def load_config(path: str | Path) -> dict[str, Any]:
     source = Path(path)
     config = yaml.safe_load(source.read_text(encoding="utf-8"))
@@ -383,17 +486,21 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     merged.update(config)
     stage = str(merged.get("stage", "stage1")).lower()
-    if stage not in {"stage1", "stage2", "stage3", "stage4", "stage5"}:
-        raise ValueError(f"stage must be one of ['stage1', 'stage2', 'stage3', 'stage4', 'stage5'], got {stage!r}")
+    if stage not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
+        raise ValueError(
+            "stage must be one of ['stage1', 'stage2', 'stage3', 'stage4', 'stage5', 'stage6'], "
+            f"got {stage!r}"
+        )
     merged["stage"] = stage
     merged["tokenizer_name"] = _resolve_tokenizer_name(merged)
     merged["contrastive"] = _resolve_contrastive_config(config, stage=stage)
     merged["classifier_head"] = _resolve_classifier_head_config(config)
     merged["local_context"] = _resolve_local_context_config(config)
     merged["motif"] = _resolve_motif_config(config)
+    merged["dual_tokenizer"] = _resolve_dual_tokenizer_config(config, stage=stage)
     merged["stage_contrastive_forced_off"] = False
     merged["stage3_contrastive_forced_off"] = False
-    if stage in {"stage3", "stage4", "stage5"} and bool(merged["contrastive"].get("enabled", False)):
+    if stage in {"stage3", "stage4", "stage5", "stage6"} and bool(merged["contrastive"].get("enabled", False)):
         merged["contrastive"]["enabled"] = False
         merged["stage_contrastive_forced_off"] = True
         merged["stage3_contrastive_forced_off"] = True
@@ -903,6 +1010,39 @@ def _encode_batch_sequences(
     return encode_sequences(tokenizer, backbone_name, sequences)
 
 
+def _validate_dual_residue_lengths(plain: list[int], special: list[int]) -> None:
+    if plain != special:
+        raise ValueError(
+            "Dual tokenizer branches produced different residue lengths: "
+            f"plain={plain!r} special={special!r}"
+        )
+
+
+def _encode_dual_batch_sequences(
+    *,
+    plain_tokenizer: Any,
+    special_tokenizer: Any,
+    backbone_name: str,
+    sequences: list[str],
+    special_motif_specs: list[MotifSpec],
+    special_motif_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    plain_encoded = encode_sequences(plain_tokenizer, backbone_name, sequences)
+    special_encoded = _encode_batch_sequences(
+        tokenizer=special_tokenizer,
+        backbone_name=backbone_name,
+        sequences=sequences,
+        motif_specs=special_motif_specs,
+        motif_cfg=special_motif_cfg,
+    )
+    _validate_dual_residue_lengths(plain_encoded.residue_lengths, special_encoded.residue_lengths)
+    return {
+        "plain": plain_encoded,
+        "special": special_encoded,
+        "residue_lengths": plain_encoded.residue_lengths,
+    }
+
+
 def _build_motif_runtime_metadata(
     specs: list[MotifSpec],
     tokenizer_info: dict[str, Any] | None,
@@ -1046,29 +1186,55 @@ def _batched_forward(
     device: torch.device,
     batch_size: int,
     mixed_precision: bool,
+    dual_tokenizer_runtime: dict[str, Any] | None = None,
 ) -> list[list[float]]:
     outputs: list[list[float]] = []
     for start in range(0, len(sequences), batch_size):
         batch_sequences = sequences[start : start + batch_size]
-        encoded = _encode_batch_sequences(
-            tokenizer=tokenizer,
-            backbone_name=backbone_name,
-            sequences=batch_sequences,
-            motif_specs=motif_specs,
-            motif_cfg=motif_cfg,
-        )
-        input_ids = encoded.input_ids.to(device)
-        attention_mask = encoded.attention_mask.to(device)
-        residue_lengths = encoded.residue_lengths
+        if dual_tokenizer_runtime is not None:
+            encoded_dual = _encode_dual_batch_sequences(
+                plain_tokenizer=dual_tokenizer_runtime["plain_tokenizer"],
+                special_tokenizer=dual_tokenizer_runtime["special_tokenizer"],
+                backbone_name=backbone_name,
+                sequences=batch_sequences,
+                special_motif_specs=dual_tokenizer_runtime["special_motif_specs"],
+                special_motif_cfg=dual_tokenizer_runtime["special_motif_cfg"],
+            )
+            plain_encoded = encoded_dual["plain"]
+            special_encoded = encoded_dual["special"]
+            residue_lengths = encoded_dual["residue_lengths"]
+            with torch.no_grad():
+                with _autocast_context(device_type=device.type, enabled=mixed_precision):
+                    branch_logits = model(
+                        plain_input_ids=plain_encoded.input_ids.to(device),
+                        plain_attention_mask=plain_encoded.attention_mask.to(device),
+                        plain_residue_lengths=plain_encoded.residue_lengths,
+                        special_input_ids=special_encoded.input_ids.to(device),
+                        special_attention_mask=special_encoded.attention_mask.to(device),
+                        special_residue_lengths=special_encoded.residue_lengths,
+                        special_token_residue_lengths=special_encoded.token_residue_lengths,
+                    )
+                    logits = branch_logits["fused_logits"]
+        else:
+            encoded = _encode_batch_sequences(
+                tokenizer=tokenizer,
+                backbone_name=backbone_name,
+                sequences=batch_sequences,
+                motif_specs=motif_specs,
+                motif_cfg=motif_cfg,
+            )
+            input_ids = encoded.input_ids.to(device)
+            attention_mask = encoded.attention_mask.to(device)
+            residue_lengths = encoded.residue_lengths
 
-        with torch.no_grad():
-            with _autocast_context(device_type=device.type, enabled=mixed_precision):
-                logits = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    residue_lengths=residue_lengths,
-                    token_residue_lengths=encoded.token_residue_lengths,
-                )
+            with torch.no_grad():
+                with _autocast_context(device_type=device.type, enabled=mixed_precision):
+                    logits = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        residue_lengths=residue_lengths,
+                        token_residue_lengths=encoded.token_residue_lengths,
+                    )
         logits = logits.detach().float().cpu()
         for row, length in enumerate(residue_lengths):
             outputs.append(logits[row, :length].tolist())
@@ -1107,6 +1273,7 @@ def evaluate_records(
     threshold: float | None,
     threshold_search: dict[str, float],
     mixed_precision: bool,
+    dual_tokenizer_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     model.eval()
     per_record: list[tuple[str, str, list[float]]] = []
@@ -1132,6 +1299,7 @@ def evaluate_records(
             device=device,
             batch_size=batch_size,
             mixed_precision=mixed_precision,
+            dual_tokenizer_runtime=dual_tokenizer_runtime,
         )
         merged_logits = merge_window_logits(
             length=len(record.sequence),
@@ -1213,6 +1381,14 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     classifier_head_cfg = dict(config.get("classifier_head", {}))
     contrastive_cfg = dict(config.get("contrastive", {}))
     motif_cfg = dict(config.get("motif", {}))
+    dual_tokenizer_cfg = dict(config.get("dual_tokenizer", {}))
+    stage6_enabled = stage == "stage6" and bool(dual_tokenizer_cfg.get("enabled", False))
+    dual_branches = dict(dual_tokenizer_cfg.get("branches", {}))
+    plain_branch_cfg = dict(dual_branches.get("plain", {}))
+    special_branch_cfg = dict(dual_branches.get("special", {}))
+    special_motif_cfg = dict(special_branch_cfg.get("motif", {}))
+    plain_loss_weight = float(plain_branch_cfg.get("weight", 0.5))
+    special_loss_weight = float(special_branch_cfg.get("weight", 0.5))
     contrastive_enabled = bool(contrastive_cfg.get("enabled", False))
     contrastive_weight = float(contrastive_cfg.get("weight", 0.0)) if contrastive_enabled else 0.0
     contrastive_temperature = float(contrastive_cfg.get("temperature", 0.1))
@@ -1308,7 +1484,19 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     motif_specs: list[MotifSpec] | None = None
     motif_vocab: dict[str, int] | None = None
     motif_stats: dict[str, Any] | None = None
-    if bool(motif_cfg.get("enabled", False)):
+    if stage6_enabled:
+        motif_specs = load_motif_specs(
+            special_motif_cfg["source"],
+            matching=str(special_motif_cfg.get("matching", "degenerate")),
+        )
+        motif_vocab = build_motif_vocab(motif_specs)
+        motif_stats = summarize_motif_coverage(all_records, motif_specs, motif_vocab)
+        log(
+            "[stage6:motif] special branch source="
+            f"{special_motif_cfg['source']} motifs={motif_stats['num_motifs']} "
+            f"coverage={motif_stats['coverage_ratio']:.4f}"
+        )
+    elif bool(motif_cfg.get("enabled", False)):
         motif_specs = load_motif_specs(
             motif_cfg["source"],
             matching=str(motif_cfg.get("matching", "degenerate")),
@@ -1354,39 +1542,122 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
 
     pos_weight, class_stats = _compute_pos_weight(train_records)
 
-    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
-        config["backbone_name"],
-        tokenizer_name=config.get("tokenizer_name"),
-    )
-    motif_tokenizer_info: dict[str, Any] | None = None
-    if bool(motif_cfg.get("enabled", False)):
+    dual_tokenizer_runtime: dict[str, Any] | None = None
+    if stage6_enabled:
         if motif_specs is None:
-            raise RuntimeError("Motif specs are missing while motif.enabled=true.")
-        motif_special_tokens = build_motif_special_tokens(motif_specs)
-        motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(backbone, tokenizer, motif_special_tokens)
-        config_resolved["motif_runtime"] = _build_motif_runtime_metadata(
-            motif_specs,
-            motif_tokenizer_info,
-            motif_cfg,
+            raise RuntimeError("Stage 6 special branch motif specs are missing.")
+        plain_backbone, plain_tokenizer, plain_hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=plain_branch_cfg.get("tokenizer_name"),
         )
+        special_backbone, special_tokenizer, special_hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=special_branch_cfg.get("tokenizer_name"),
+        )
+        if plain_hidden_size != special_hidden_size:
+            raise ValueError(
+                "Stage 6 branch hidden sizes must match: "
+                f"plain={plain_hidden_size} special={special_hidden_size}"
+            )
+        special_tokens = build_motif_special_tokens(motif_specs)
+        motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(
+            special_backbone,
+            special_tokenizer,
+            special_tokens,
+        )
+        config_resolved["dual_tokenizer_runtime"] = {
+            "fusion": dual_tokenizer_cfg.get("fusion"),
+            "plain": {
+                "weight": plain_loss_weight,
+                "tokenizer_name": plain_branch_cfg.get("tokenizer_name"),
+                "motif": plain_branch_cfg.get("motif"),
+            },
+            "special": {
+                "weight": special_loss_weight,
+                "tokenizer_name": special_branch_cfg.get("tokenizer_name"),
+                "motif": special_motif_cfg,
+                "motif_runtime": _build_motif_runtime_metadata(
+                    motif_specs,
+                    motif_tokenizer_info,
+                    special_motif_cfg,
+                ),
+            },
+        }
+        plain_model = ResidueClassifier(
+            backbone=plain_backbone,
+            hidden_size=plain_hidden_size,
+            dropout=float(config["dropout"]),
+            freeze_backbone=bool(config["freeze_backbone"]),
+            projection_dim=int(contrastive_cfg["proj_dim"]),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif={"enabled": False},
+            motif_vocab_size=0,
+        )
+        special_model = ResidueClassifier(
+            backbone=special_backbone,
+            hidden_size=special_hidden_size,
+            dropout=float(config["dropout"]),
+            freeze_backbone=bool(config["freeze_backbone"]),
+            projection_dim=int(contrastive_cfg["proj_dim"]),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif=special_motif_cfg,
+            motif_vocab_size=len(motif_vocab) if motif_vocab is not None else 0,
+        )
+        configure_trainable_token_embeddings(special_backbone, motif_tokenizer_info["token_ids"])
+        model = DualTokenizerResidueClassifier(
+            plain_model=plain_model,
+            special_model=special_model,
+            plain_weight=plain_loss_weight,
+            special_weight=special_loss_weight,
+        ).to(device)
+        tokenizer = plain_tokenizer
+        dual_tokenizer_runtime = {
+            "plain_tokenizer": plain_tokenizer,
+            "special_tokenizer": special_tokenizer,
+            "special_motif_specs": motif_specs,
+            "special_motif_cfg": special_motif_cfg,
+        }
         log(
-            "[motif] trained tokenizer special tokens="
-            f"{len(motif_special_tokens)} tokenizer={config.get('tokenizer_name')} "
-            f"strategy={config_resolved['motif_runtime']['alignment_strategy']}"
+            "[stage6] dual tokenizer enabled "
+            f"plain_weight={plain_loss_weight:.4f} special_weight={special_loss_weight:.4f} "
+            f"special_tokens={len(special_tokens)}"
         )
-    model = ResidueClassifier(
-        backbone=backbone,
-        hidden_size=hidden_size,
-        dropout=float(config["dropout"]),
-        freeze_backbone=bool(config["freeze_backbone"]),
-        projection_dim=int(contrastive_cfg["proj_dim"]),
-        classifier_head=classifier_head_cfg,
-        local_context=dict(config.get("local_context", {})),
-        motif=motif_cfg,
-        motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
-    ).to(device)
-    if motif_tokenizer_info is not None:
-        configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
+    else:
+        backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=config.get("tokenizer_name"),
+        )
+        motif_tokenizer_info: dict[str, Any] | None = None
+        if bool(motif_cfg.get("enabled", False)):
+            if motif_specs is None:
+                raise RuntimeError("Motif specs are missing while motif.enabled=true.")
+            motif_special_tokens = build_motif_special_tokens(motif_specs)
+            motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(backbone, tokenizer, motif_special_tokens)
+            config_resolved["motif_runtime"] = _build_motif_runtime_metadata(
+                motif_specs,
+                motif_tokenizer_info,
+                motif_cfg,
+            )
+            log(
+                "[motif] trained tokenizer special tokens="
+                f"{len(motif_special_tokens)} tokenizer={config.get('tokenizer_name')} "
+                f"strategy={config_resolved['motif_runtime']['alignment_strategy']}"
+            )
+        model = ResidueClassifier(
+            backbone=backbone,
+            hidden_size=hidden_size,
+            dropout=float(config["dropout"]),
+            freeze_backbone=bool(config["freeze_backbone"]),
+            projection_dim=int(contrastive_cfg["proj_dim"]),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif=motif_cfg,
+            motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
+        ).to(device)
+        if motif_tokenizer_info is not None:
+            configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
 
     batch_size = max(1, int(config["batch_tokens"]) // int(config["window_size"]))
     train_dataset = TrainDataset(train_records, window_size=int(config["window_size"]), seed=int(config["seed"]))
@@ -1394,6 +1665,29 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     def _collate(batch: list[TrainItem]) -> dict[str, Any]:
         sequences = [item.sequence for item in batch]
         labels = [item.labels for item in batch]
+        if stage6_enabled:
+            if dual_tokenizer_runtime is None or motif_specs is None:
+                raise RuntimeError("Stage 6 runtime is not initialized.")
+            encoded_dual = _encode_dual_batch_sequences(
+                plain_tokenizer=dual_tokenizer_runtime["plain_tokenizer"],
+                special_tokenizer=dual_tokenizer_runtime["special_tokenizer"],
+                backbone_name=config["backbone_name"],
+                sequences=sequences,
+                special_motif_specs=motif_specs,
+                special_motif_cfg=special_motif_cfg,
+            )
+            label_tensor = _labels_to_tensor(labels, encoded_dual["residue_lengths"])
+            return {
+                "plain_input_ids": encoded_dual["plain"].input_ids,
+                "plain_attention_mask": encoded_dual["plain"].attention_mask,
+                "plain_residue_lengths": encoded_dual["plain"].residue_lengths,
+                "special_input_ids": encoded_dual["special"].input_ids,
+                "special_attention_mask": encoded_dual["special"].attention_mask,
+                "special_residue_lengths": encoded_dual["special"].residue_lengths,
+                "special_token_residue_lengths": encoded_dual["special"].token_residue_lengths,
+                "residue_lengths": encoded_dual["residue_lengths"],
+                "labels": label_tensor,
+            }
         encoded = _encode_batch_sequences(
             tokenizer=tokenizer,
             backbone_name=config["backbone_name"],
@@ -1542,6 +1836,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             threshold=None,
             threshold_search=config["threshold_search"],
             mixed_precision=use_amp,
+            dual_tokenizer_runtime=dual_tokenizer_runtime,
         )
         train_metrics = train_result["metrics"]
 
@@ -1561,6 +1856,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             threshold=None,
             threshold_search=config["threshold_search"],
             mixed_precision=use_amp,
+            dual_tokenizer_runtime=dual_tokenizer_runtime,
         )
         val_metrics = val_result["metrics"]
         val_threshold = float(val_result["threshold"])
@@ -1638,56 +1934,85 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             running_total_loss = 0.0
             running_bce_loss = 0.0
             running_supcon_loss = 0.0
+            running_plain_bce_loss = 0.0
+            running_special_bce_loss = 0.0
             steps = 0
             window_total_loss = 0.0
             window_bce_loss = 0.0
             window_supcon_loss = 0.0
+            window_plain_bce_loss = 0.0
+            window_special_bce_loss = 0.0
             window_steps = 0
             eval_happened_in_epoch = False
 
             for batch in train_loader:
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
                 labels = batch["labels"].to(device)
-                residue_lengths = batch["residue_lengths"]
-                token_residue_lengths = batch["token_residue_lengths"]
 
                 optimizer.zero_grad(set_to_none=True)
                 with _autocast_context(device_type=device.type, enabled=use_amp):
-                    if contrastive_enabled:
-                        logits, residue_embeddings = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            residue_lengths=residue_lengths,
-                            token_residue_lengths=token_residue_lengths,
-                            return_embeddings=True,
+                    if stage6_enabled:
+                        branch_logits = model(
+                            plain_input_ids=batch["plain_input_ids"].to(device),
+                            plain_attention_mask=batch["plain_attention_mask"].to(device),
+                            plain_residue_lengths=batch["plain_residue_lengths"],
+                            special_input_ids=batch["special_input_ids"].to(device),
+                            special_attention_mask=batch["special_attention_mask"].to(device),
+                            special_residue_lengths=batch["special_residue_lengths"],
+                            special_token_residue_lengths=batch["special_token_residue_lengths"],
                         )
-                    else:
-                        logits = model(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            residue_lengths=residue_lengths,
-                            token_residue_lengths=token_residue_lengths,
-                        )
-                        residue_embeddings = None
-                    mask = labels >= 0
-                    valid_count = int(mask.sum().item())
-                    if valid_count == 0:
-                        continue
-                    loss_matrix = criterion(logits, labels)
-                    bce_loss = (loss_matrix * mask).sum() / valid_count
-
-                    contrastive_num_samples = 0
-                    if contrastive_enabled and residue_embeddings is not None:
-                        supcon_loss, contrastive_num_samples = _compute_batch_supcon_loss(
-                            residue_embeddings,
-                            labels,
-                            max_samples_per_class=contrastive_max_samples,
-                            temperature=contrastive_temperature,
-                        )
-                    else:
+                        mask = labels >= 0
+                        valid_count = int(mask.sum().item())
+                        if valid_count == 0:
+                            continue
+                        plain_loss_matrix = criterion(branch_logits["plain_logits"], labels)
+                        special_loss_matrix = criterion(branch_logits["special_logits"], labels)
+                        plain_bce_loss = (plain_loss_matrix * mask).sum() / valid_count
+                        special_bce_loss = (special_loss_matrix * mask).sum() / valid_count
+                        bce_loss = plain_loss_weight * plain_bce_loss + special_loss_weight * special_bce_loss
                         supcon_loss = bce_loss.new_zeros(())
-                    total_loss = bce_loss + contrastive_weight * supcon_loss
+                        contrastive_num_samples = 0
+                        total_loss = bce_loss
+                    else:
+                        input_ids = batch["input_ids"].to(device)
+                        attention_mask = batch["attention_mask"].to(device)
+                        residue_lengths = batch["residue_lengths"]
+                        token_residue_lengths = batch["token_residue_lengths"]
+                        if contrastive_enabled:
+                            logits, residue_embeddings = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                residue_lengths=residue_lengths,
+                                token_residue_lengths=token_residue_lengths,
+                                return_embeddings=True,
+                            )
+                        else:
+                            logits = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                residue_lengths=residue_lengths,
+                                token_residue_lengths=token_residue_lengths,
+                            )
+                            residue_embeddings = None
+                        mask = labels >= 0
+                        valid_count = int(mask.sum().item())
+                        if valid_count == 0:
+                            continue
+                        loss_matrix = criterion(logits, labels)
+                        bce_loss = (loss_matrix * mask).sum() / valid_count
+                        plain_bce_loss = bce_loss.new_zeros(())
+                        special_bce_loss = bce_loss.new_zeros(())
+
+                        contrastive_num_samples = 0
+                        if contrastive_enabled and residue_embeddings is not None:
+                            supcon_loss, contrastive_num_samples = _compute_batch_supcon_loss(
+                                residue_embeddings,
+                                labels,
+                                max_samples_per_class=contrastive_max_samples,
+                                temperature=contrastive_temperature,
+                            )
+                        else:
+                            supcon_loss = bce_loss.new_zeros(())
+                        total_loss = bce_loss + contrastive_weight * supcon_loss
 
                 scaler.scale(total_loss).backward()
                 scaler.step(optimizer)
@@ -1696,20 +2021,29 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 total_loss_value = float(total_loss.detach().cpu().item())
                 bce_loss_value = float(bce_loss.detach().cpu().item())
                 supcon_loss_value = float(supcon_loss.detach().cpu().item())
+                plain_bce_loss_value = float(plain_bce_loss.detach().cpu().item())
+                special_bce_loss_value = float(special_bce_loss.detach().cpu().item())
                 global_step += 1
                 running_total_loss += total_loss_value
                 running_bce_loss += bce_loss_value
                 running_supcon_loss += supcon_loss_value
+                running_plain_bce_loss += plain_bce_loss_value
+                running_special_bce_loss += special_bce_loss_value
                 steps += 1
                 window_total_loss += total_loss_value
                 window_bce_loss += bce_loss_value
                 window_supcon_loss += supcon_loss_value
+                window_plain_bce_loss += plain_bce_loss_value
+                window_special_bce_loss += special_bce_loss_value
                 window_steps += 1
 
                 writer.add_scalar("train/loss_step", total_loss_value, global_step)
                 writer.add_scalar("train/loss_total", total_loss_value, global_step)
                 writer.add_scalar("train/loss_bce", bce_loss_value, global_step)
                 writer.add_scalar("train/loss_supcon", supcon_loss_value, global_step)
+                writer.add_scalar("train/loss_plain_bce", plain_bce_loss_value, global_step)
+                writer.add_scalar("train/loss_special_bce", special_bce_loss_value, global_step)
+                writer.add_scalar("train/loss_fused_total", total_loss_value, global_step)
                 writer.add_scalar("train/contrastive_num_samples", contrastive_num_samples, global_step)
                 writer.add_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), global_step)
                 _wandb_log(
@@ -1719,6 +2053,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                         "train/loss_total": total_loss_value,
                         "train/loss_bce": bce_loss_value,
                         "train/loss_supcon": supcon_loss_value,
+                        "train/loss_plain_bce": plain_bce_loss_value,
+                        "train/loss_special_bce": special_bce_loss_value,
+                        "train/loss_fused_total": total_loss_value,
                         "train/contrastive_num_samples": contrastive_num_samples,
                         "train/lr": float(optimizer.param_groups[0]["lr"]),
                     },
@@ -1729,25 +2066,34 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                     avg_window_total = window_total_loss / max(1, window_steps)
                     avg_window_bce = window_bce_loss / max(1, window_steps)
                     avg_window_supcon = window_supcon_loss / max(1, window_steps)
+                    avg_window_plain_bce = window_plain_bce_loss / max(1, window_steps)
+                    avg_window_special_bce = window_special_bce_loss / max(1, window_steps)
                     print_event = {
                         "epoch": epoch,
                         "global_step": global_step,
                         "avg_loss": avg_window_total,
                         "avg_bce_loss": avg_window_bce,
                         "avg_supcon_loss": avg_window_supcon,
+                        "avg_plain_bce_loss": avg_window_plain_bce,
+                        "avg_special_bce_loss": avg_window_special_bce,
                     }
                     print_history.append(print_event)
                     log(
                         f"[train] epoch={epoch} step={global_step} "
                         f"avg_total={avg_window_total:.6f} avg_bce={avg_window_bce:.6f} "
-                        f"avg_supcon={avg_window_supcon:.6f}"
+                        f"avg_supcon={avg_window_supcon:.6f} "
+                        f"avg_plain_bce={avg_window_plain_bce:.6f} avg_special_bce={avg_window_special_bce:.6f}"
                     )
                     writer.add_scalar("train/loss_print_avg", avg_window_total, global_step)
                     writer.add_scalar("train/loss_bce_print_avg", avg_window_bce, global_step)
                     writer.add_scalar("train/loss_supcon_print_avg", avg_window_supcon, global_step)
+                    writer.add_scalar("train/loss_plain_bce_print_avg", avg_window_plain_bce, global_step)
+                    writer.add_scalar("train/loss_special_bce_print_avg", avg_window_special_bce, global_step)
                     window_total_loss = 0.0
                     window_bce_loss = 0.0
                     window_supcon_loss = 0.0
+                    window_plain_bce_loss = 0.0
+                    window_special_bce_loss = 0.0
                     window_steps = 0
 
                 if global_step % save_every == 0:
@@ -1781,25 +2127,34 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 avg_window_total = window_total_loss / max(1, window_steps)
                 avg_window_bce = window_bce_loss / max(1, window_steps)
                 avg_window_supcon = window_supcon_loss / max(1, window_steps)
+                avg_window_plain_bce = window_plain_bce_loss / max(1, window_steps)
+                avg_window_special_bce = window_special_bce_loss / max(1, window_steps)
                 print_event = {
                     "epoch": epoch,
                     "global_step": global_step,
                     "avg_loss": avg_window_total,
                     "avg_bce_loss": avg_window_bce,
                     "avg_supcon_loss": avg_window_supcon,
+                    "avg_plain_bce_loss": avg_window_plain_bce,
+                    "avg_special_bce_loss": avg_window_special_bce,
                 }
                 print_history.append(print_event)
                 log(
                     f"[train] epoch={epoch} step={global_step} avg_total={avg_window_total:.6f} "
                     f"avg_bce={avg_window_bce:.6f} avg_supcon={avg_window_supcon:.6f} (epoch_end_flush)"
+                    f" avg_plain_bce={avg_window_plain_bce:.6f} avg_special_bce={avg_window_special_bce:.6f}"
                 )
                 writer.add_scalar("train/loss_print_avg", avg_window_total, global_step)
                 writer.add_scalar("train/loss_bce_print_avg", avg_window_bce, global_step)
                 writer.add_scalar("train/loss_supcon_print_avg", avg_window_supcon, global_step)
+                writer.add_scalar("train/loss_plain_bce_print_avg", avg_window_plain_bce, global_step)
+                writer.add_scalar("train/loss_special_bce_print_avg", avg_window_special_bce, global_step)
 
             train_loss = running_total_loss / max(1, steps)
             train_bce_loss = running_bce_loss / max(1, steps)
             train_supcon_loss = running_supcon_loss / max(1, steps)
+            train_plain_bce_loss = running_plain_bce_loss / max(1, steps)
+            train_special_bce_loss = running_special_bce_loss / max(1, steps)
             epoch_seconds = round(time.time() - start_time, 3)
             history.append(
                 {
@@ -1808,6 +2163,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                     "train_loss": train_loss,
                     "train_bce_loss": train_bce_loss,
                     "train_supcon_loss": train_supcon_loss,
+                    "train_plain_bce_loss": train_plain_bce_loss,
+                    "train_special_bce_loss": train_special_bce_loss,
+                    "train_fused_total_loss": train_loss,
                     "epoch_seconds": epoch_seconds,
                     "train_steps": steps,
                 }
@@ -1815,6 +2173,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             writer.add_scalar("train/loss_epoch", train_loss, epoch)
             writer.add_scalar("train/loss_bce_epoch", train_bce_loss, epoch)
             writer.add_scalar("train/loss_supcon_epoch", train_supcon_loss, epoch)
+            writer.add_scalar("train/loss_plain_bce_epoch", train_plain_bce_loss, epoch)
+            writer.add_scalar("train/loss_special_bce_epoch", train_special_bce_loss, epoch)
+            writer.add_scalar("train/loss_fused_total_epoch", train_loss, epoch)
             writer.add_scalar("train/epoch_seconds", epoch_seconds, epoch)
             _wandb_log(
                 wandb_run,
@@ -1822,6 +2183,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                     "train/loss_epoch": train_loss,
                     "train/loss_bce_epoch": train_bce_loss,
                     "train/loss_supcon_epoch": train_supcon_loss,
+                    "train/loss_plain_bce_epoch": train_plain_bce_loss,
+                    "train/loss_special_bce_epoch": train_special_bce_loss,
+                    "train/loss_fused_total_epoch": train_loss,
                     "train/epoch_seconds": epoch_seconds,
                     "train/epoch": epoch,
                 },
@@ -1830,7 +2194,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             log(
                 f"[epoch] epoch={epoch} steps={steps} global_step={global_step} "
                 f"train_total={train_loss:.6f} train_bce={train_bce_loss:.6f} "
-                f"train_supcon={train_supcon_loss:.6f} epoch_seconds={epoch_seconds:.3f}"
+                f"train_supcon={train_supcon_loss:.6f} "
+                f"train_plain_bce={train_plain_bce_loss:.6f} "
+                f"train_special_bce={train_special_bce_loss:.6f} epoch_seconds={epoch_seconds:.3f}"
             )
 
             if stop_training:
@@ -1918,6 +2284,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         threshold=best_threshold,
         threshold_search=config["threshold_search"],
         mixed_precision=use_amp,
+        dual_tokenizer_runtime=dual_tokenizer_runtime,
     )
     log(
         "[caid3] "
@@ -1993,6 +2360,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             "contrastive": contrastive_cfg,
             "motif": motif_cfg,
             "motif_stats": motif_stats,
+            "dual_tokenizer": dual_tokenizer_cfg,
             "global_steps": global_step,
             "save_every": save_every,
             "print_every": print_every,
@@ -2030,6 +2398,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         "contrastive": contrastive_cfg,
         "motif": motif_cfg,
         "motif_stats": motif_stats,
+        "dual_tokenizer": dual_tokenizer_cfg,
         "caid3_metrics": caid_eval["metrics"],
     }
 
@@ -2103,43 +2472,115 @@ def evaluate(
             raise ValueError(f"split_key {split_key!r} not found in split manifest.")
         records = select_records(records, manifest[split_key])
 
+    stage = str(config.get("stage", "stage1")).lower()
     classifier_head_cfg = _resolve_classifier_head_config(config)
     motif_cfg = _resolve_motif_config(config)
+    dual_tokenizer_cfg = _resolve_dual_tokenizer_config(config, stage=stage)
+    stage6_enabled = stage == "stage6" and bool(dual_tokenizer_cfg.get("enabled", False))
+    dual_branches = dict(dual_tokenizer_cfg.get("branches", {}))
+    plain_branch_cfg = dict(dual_branches.get("plain", {}))
+    special_branch_cfg = dict(dual_branches.get("special", {}))
+    special_motif_cfg = dict(special_branch_cfg.get("motif", {}))
     motif_specs: list[MotifSpec] | None = None
     motif_vocab: dict[str, int] | None = None
-    if bool(motif_cfg.get("enabled", False)):
+    if stage6_enabled:
+        motif_specs = load_motif_specs(
+            special_motif_cfg["source"],
+            matching=str(special_motif_cfg.get("matching", "degenerate")),
+        )
+        motif_vocab = build_motif_vocab(motif_specs)
+    elif bool(motif_cfg.get("enabled", False)):
         motif_specs = load_motif_specs(
             motif_cfg["source"],
             matching=str(motif_cfg.get("matching", "degenerate")),
         )
         motif_vocab = build_motif_vocab(motif_specs)
 
-    backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
-        config["backbone_name"],
-        tokenizer_name=config.get("tokenizer_name"),
-    )
-    motif_tokenizer_info: dict[str, Any] | None = None
-    if bool(motif_cfg.get("enabled", False)):
+    dual_tokenizer_runtime: dict[str, Any] | None = None
+    if stage6_enabled:
         if motif_specs is None:
-            raise RuntimeError("Motif specs are missing while motif.enabled=true.")
+            raise RuntimeError("Stage 6 special branch motif specs are missing.")
+        plain_backbone, plain_tokenizer, plain_hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=plain_branch_cfg.get("tokenizer_name"),
+        )
+        special_backbone, special_tokenizer, special_hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=special_branch_cfg.get("tokenizer_name"),
+        )
+        if plain_hidden_size != special_hidden_size:
+            raise ValueError(
+                "Stage 6 branch hidden sizes must match: "
+                f"plain={plain_hidden_size} special={special_hidden_size}"
+            )
         motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(
-            backbone,
-            tokenizer,
+            special_backbone,
+            special_tokenizer,
             build_motif_special_tokens(motif_specs),
         )
-    model = ResidueClassifier(
-        backbone=backbone,
-        hidden_size=hidden_size,
-        dropout=float(config.get("dropout", 0.1)),
-        freeze_backbone=bool(config.get("freeze_backbone", True)),
-        projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
-        classifier_head=classifier_head_cfg,
-        local_context=dict(config.get("local_context", {})),
-        motif=motif_cfg,
-        motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
-    )
-    if motif_tokenizer_info is not None:
-        configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
+        plain_model = ResidueClassifier(
+            backbone=plain_backbone,
+            hidden_size=plain_hidden_size,
+            dropout=float(config.get("dropout", 0.1)),
+            freeze_backbone=bool(config.get("freeze_backbone", True)),
+            projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif={"enabled": False},
+            motif_vocab_size=0,
+        )
+        special_model = ResidueClassifier(
+            backbone=special_backbone,
+            hidden_size=special_hidden_size,
+            dropout=float(config.get("dropout", 0.1)),
+            freeze_backbone=bool(config.get("freeze_backbone", True)),
+            projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif=special_motif_cfg,
+            motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
+        )
+        configure_trainable_token_embeddings(special_backbone, motif_tokenizer_info["token_ids"])
+        model = DualTokenizerResidueClassifier(
+            plain_model=plain_model,
+            special_model=special_model,
+            plain_weight=float(plain_branch_cfg.get("weight", 0.5)),
+            special_weight=float(special_branch_cfg.get("weight", 0.5)),
+        )
+        tokenizer = plain_tokenizer
+        dual_tokenizer_runtime = {
+            "plain_tokenizer": plain_tokenizer,
+            "special_tokenizer": special_tokenizer,
+            "special_motif_specs": motif_specs,
+            "special_motif_cfg": special_motif_cfg,
+        }
+    else:
+        backbone, tokenizer, hidden_size = load_backbone_and_tokenizer(
+            config["backbone_name"],
+            tokenizer_name=config.get("tokenizer_name"),
+        )
+        motif_tokenizer_info: dict[str, Any] | None = None
+        if bool(motif_cfg.get("enabled", False)):
+            if motif_specs is None:
+                raise RuntimeError("Motif specs are missing while motif.enabled=true.")
+            motif_tokenizer_info = prepare_backbone_for_motif_tokenizer(
+                backbone,
+                tokenizer,
+                build_motif_special_tokens(motif_specs),
+            )
+        model = ResidueClassifier(
+            backbone=backbone,
+            hidden_size=hidden_size,
+            dropout=float(config.get("dropout", 0.1)),
+            freeze_backbone=bool(config.get("freeze_backbone", True)),
+            projection_dim=int(config.get("contrastive", {}).get("proj_dim", 128)),
+            classifier_head=classifier_head_cfg,
+            local_context=dict(config.get("local_context", {})),
+            motif=motif_cfg,
+            motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
+        )
+        if motif_tokenizer_info is not None:
+            configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
     _load_model_state(model, checkpoint["model_state"], logger=log)
     device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
     model.to(device)
@@ -2161,6 +2602,7 @@ def evaluate(
         threshold=resolved_threshold,
         threshold_search=config["threshold_search"],
         mixed_precision=(device.type == "cuda"),
+        dual_tokenizer_runtime=dual_tokenizer_runtime,
     )
     eval_wandb: dict[str, Any] = {
         "eval/auprc": float(result["metrics"]["auprc"]),
@@ -2193,6 +2635,7 @@ def evaluate(
             "threshold": resolved_threshold,
             "batch_size": batch_size,
             "motif": motif_cfg,
+            "dual_tokenizer": dual_tokenizer_cfg,
         },
     )
     log(

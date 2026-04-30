@@ -536,3 +536,101 @@ def test_stage5_train_eval_smoke_with_motif_special_tokens(tmp_path: Path) -> No
     eval_result = evaluate(checkpoint_path=checkpoint_path, fasta_path=caid_fasta)
     assert Path(eval_result["predictions_path"]).exists()
     assert Path(eval_result["metrics_path"]).exists()
+
+
+def test_stage6_train_eval_smoke_with_dual_tokenizers(tmp_path: Path) -> None:
+    train_fasta = tmp_path / "disprot.fasta"
+    train_fasta.write_text(
+        (
+            _make_record("D1", 60, 10, 8)
+            + _make_record("D2", 64, 20, 12)
+            + _make_record("D3", 72, 5, 10)
+            + _make_record("D4", 80, 40, 6)
+            + _make_record("D5", 70, 30, 5)
+            + _make_record("D6", 75, 45, 7)
+        ),
+        encoding="utf-8",
+    )
+    caid_fasta = tmp_path / "caid.fasta"
+    caid_fasta.write_text(_make_record("D6", 75, 45, 7) + _make_record("C1", 68, 22, 8), encoding="utf-8")
+    error_file = tmp_path / "error.txt"
+    error_file.write_text(">D5\n", encoding="utf-8")
+    split_out = tmp_path / "split.json"
+    exclusion_out = tmp_path / "exclude.json"
+    prepare_data(
+        fasta_path=train_fasta,
+        error_file=error_file,
+        caid_fasta=caid_fasta,
+        seed=42,
+        val_ratio=0.25,
+        split_out=split_out,
+        exclusion_out=exclusion_out,
+    )
+    motif_source = tmp_path / "motifs.json"
+    motif_source.write_text(
+        '{"motifs":[{"id":"M1","kind":"prosite","ac":"PS00001","pa":"P-x(2)-P."}]}',
+        encoding="utf-8",
+    )
+    config = {
+        "stage": "stage6",
+        "backbone_name": "dummy",
+        "window_size": 64,
+        "batch_tokens": 128,
+        "optimizer": "adamw",
+        "lr": 1e-3,
+        "weight_decay": 0.0,
+        "max_epochs": 2,
+        "early_stop_patience": 2,
+        "seed": 42,
+        "threshold_search": {"min": 0.1, "max": 0.9, "step": 0.1},
+        "classifier_head": {"type": "mlp5", "hidden_dims": [128, 64, 32, 16]},
+        "contrastive": {"enabled": False},
+        "dual_tokenizer": {
+            "enabled": True,
+            "fusion": "weighted_logits",
+            "branches": {
+                "plain": {"weight": 0.5, "motif": {"enabled": False}},
+                "special": {
+                    "weight": 0.5,
+                    "motif": {
+                        "enabled": True,
+                        "source": str(motif_source),
+                        "matching": "prosite",
+                        "tokenization": "special_token",
+                    },
+                },
+            },
+        },
+        "train_fasta": str(train_fasta),
+        "caid_fasta": str(caid_fasta),
+        "split_manifest": str(split_out),
+        "output_dir": str(tmp_path / "run_stage6"),
+        "device": "cpu",
+        "eval_stride": 32,
+        "top_k_heuristic": 2,
+        "save_every": 1,
+        "print_every": 1,
+        "eval_every": 2,
+        "auto_start_tensorboard": False,
+    }
+    config_path = tmp_path / "config_stage6.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    train_result = train(config_path)
+    assert train_result["stage"] == "stage6"
+    assert train_result["dual_tokenizer"]["branches"]["plain"]["weight"] == 0.5
+    assert train_result["dual_tokenizer"]["branches"]["special"]["weight"] == 0.5
+    assert train_result["motif_stats"]["num_motifs"] == 1
+    checkpoint_path = Path(train_result["best_checkpoint"])
+
+    train_history = json.loads(
+        (Path(train_result["output_dir"]) / "metrics" / "train_history.json").read_text(encoding="utf-8")
+    )
+    assert train_history["epoch_history"]
+    first_epoch = train_history["epoch_history"][0]
+    assert "train_plain_bce_loss" in first_epoch
+    assert "train_special_bce_loss" in first_epoch
+    assert "train_fused_total_loss" in first_epoch
+
+    eval_result = evaluate(checkpoint_path=checkpoint_path, fasta_path=caid_fasta)
+    assert Path(eval_result["predictions_path"]).exists()
+    assert Path(eval_result["metrics_path"]).exists()

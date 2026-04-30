@@ -4,8 +4,8 @@ tokenizer_name: configs/prosite_tokenizer
 window_size: 1024
 batch_tokens: 2048
 optimizer: adamw
-lr: 0.00012
-weight_decay: 0.02
+lr: 0.0002
+weight_decay: 0.01
 max_epochs: 30
 early_stop_patience: 6
 seed: 42
@@ -23,13 +23,13 @@ device: cuda
 
 local_context:
   enabled: true
-  radius: 1
+  radius: 2
   mode: concat_window
   include_self: true
 
 classifier_head:
   type: cnn
-  dropout: 0.30
+  dropout: 0.25
   activation: relu
   conv_channels: [256, 256, 256]
   kernel_size: 3
@@ -37,9 +37,11 @@ classifier_head:
 
 motif:
   enabled: true
-  source: configs/prosite_motif_library_full.json
-  matching: prosite
-  tokenization: special_token
+  source: configs/motif_library_from_profile_full.json
+  matching: regex
+  max_per_residue: 1
+  embedding_dim: 64
+  fusion: gated
 
 contrastive:
   enabled: false
@@ -51,7 +53,7 @@ contrastive:
 train_fasta: dataset/disprot_202312_linker_label.fasta
 caid_fasta: dataset/linker.fasta
 split_manifest: artifacts/splits/disprot_split_seed42.json
-output_dir: artifacts/runs/stage5_prostt5_motif
+output_dir: artifacts/runs/stage5_prostt5_motif_emb64
 experiment_prefix: exp
 save_every: 500
 print_every: 20
@@ -64,5 +66,5 @@ wandb_entity: 3151599052-nankai-university
 wandb_project: CLIPer
 wandb_mode: online
 wandb_run_name: null
-wandb_group: stage5_prosite_special_token
-wandb_tags: [stage5, bce, prosite, special-token]
+wandb_group: stage5_motif_emb64
+wandb_tags: [stage5, bce, motif, emb64, gated]

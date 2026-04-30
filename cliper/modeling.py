@@ -593,6 +593,61 @@ class ResidueClassifier(nn.Module):
         return logits, embeddings
 
 
+class DualTokenizerResidueClassifier(nn.Module):
+    def __init__(
+        self,
+        *,
+        plain_model: ResidueClassifier,
+        special_model: ResidueClassifier,
+        plain_weight: float,
+        special_weight: float,
+    ) -> None:
+        super().__init__()
+        self.plain_model = plain_model
+        self.special_model = special_model
+        self.plain_weight = float(plain_weight)
+        self.special_weight = float(special_weight)
+
+    def forward(
+        self,
+        *,
+        plain_input_ids: torch.Tensor,
+        plain_attention_mask: torch.Tensor,
+        plain_residue_lengths: list[int],
+        special_input_ids: torch.Tensor,
+        special_attention_mask: torch.Tensor,
+        special_residue_lengths: list[int],
+        special_token_residue_lengths: list[list[int]] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if plain_residue_lengths != special_residue_lengths:
+            raise ValueError(
+                "Dual tokenizer branches produced different residue lengths: "
+                f"plain={plain_residue_lengths!r} special={special_residue_lengths!r}"
+            )
+        plain_logits = self.plain_model(
+            input_ids=plain_input_ids,
+            attention_mask=plain_attention_mask,
+            residue_lengths=plain_residue_lengths,
+        )
+        special_logits = self.special_model(
+            input_ids=special_input_ids,
+            attention_mask=special_attention_mask,
+            residue_lengths=special_residue_lengths,
+            token_residue_lengths=special_token_residue_lengths,
+        )
+        if plain_logits.shape != special_logits.shape:
+            raise ValueError(
+                "Dual tokenizer branch logits shape mismatch: "
+                f"plain={tuple(plain_logits.shape)} special={tuple(special_logits.shape)}"
+            )
+        fused_logits = self.plain_weight * plain_logits + self.special_weight * special_logits
+        return {
+            "plain_logits": plain_logits,
+            "special_logits": special_logits,
+            "fused_logits": fused_logits,
+        }
+
+
 def _resolve_hidden_size(backbone: nn.Module) -> int:
     config = getattr(backbone, "config", None)
     if config is None:

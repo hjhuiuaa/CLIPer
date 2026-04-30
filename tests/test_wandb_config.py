@@ -307,6 +307,119 @@ def test_load_config_rejects_stage5_motif_missing_source(tmp_path: Path) -> None
         load_config(config_path)
 
 
+def test_load_config_accepts_stage6_dual_tokenizer(tmp_path: Path) -> None:
+    motif_path = tmp_path / "motifs.json"
+    motif_path.write_text('{"motifs":[{"id":"M1","pattern":"P..P"}]}', encoding="utf-8")
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage6",
+            "classifier_head": {"type": "cnn"},
+            "contrastive": {"enabled": True},
+            "dual_tokenizer": {
+                "enabled": True,
+                "fusion": "weighted_logits",
+                "branches": {
+                    "plain": {"weight": 0.5, "motif": {"enabled": False}},
+                    "special": {
+                        "weight": 0.5,
+                        "motif": {
+                            "enabled": True,
+                            "source": str(motif_path),
+                            "matching": "regex",
+                            "tokenization": "special_token",
+                        },
+                    },
+                },
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage6.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    loaded = load_config(config_path)
+    assert loaded["stage"] == "stage6"
+    assert loaded["contrastive"]["enabled"] is False
+    assert loaded["dual_tokenizer"]["branches"]["plain"]["weight"] == 0.5
+    assert loaded["dual_tokenizer"]["branches"]["special"]["weight"] == 0.5
+    assert loaded["dual_tokenizer"]["branches"]["special"]["motif"]["enabled"] is True
+
+
+def test_load_config_rejects_stage6_dual_weights_not_sum_one(tmp_path: Path) -> None:
+    motif_path = tmp_path / "motifs.json"
+    motif_path.write_text('{"motifs":[{"id":"M1","pattern":"P..P"}]}', encoding="utf-8")
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage6",
+            "dual_tokenizer": {
+                "enabled": True,
+                "branches": {
+                    "plain": {"weight": 0.8, "motif": {"enabled": False}},
+                    "special": {
+                        "weight": 0.5,
+                        "motif": {"enabled": True, "source": str(motif_path)},
+                    },
+                },
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage6_bad_weights.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="weights"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_stage6_missing_special_tokenizer_for_real_backbone(tmp_path: Path) -> None:
+    motif_path = tmp_path / "motifs.json"
+    motif_path.write_text('{"motifs":[{"id":"M1","pattern":"P..P"}]}', encoding="utf-8")
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage6",
+            "backbone_name": "Rostlab/ProstT5",
+            "dual_tokenizer": {
+                "enabled": True,
+                "branches": {
+                    "plain": {"weight": 0.5, "motif": {"enabled": False}},
+                    "special": {
+                        "weight": 0.5,
+                        "tokenizer_name": None,
+                        "motif": {"enabled": True, "source": str(motif_path)},
+                    },
+                },
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage6_bad_tokenizer.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="tokenizer_name"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_stage6_missing_special_motif_source(tmp_path: Path) -> None:
+    config = _base_config()
+    config.update(
+        {
+            "stage": "stage6",
+            "dual_tokenizer": {
+                "enabled": True,
+                "branches": {
+                    "plain": {"weight": 0.5, "motif": {"enabled": False}},
+                    "special": {"weight": 0.5, "motif": {"enabled": True}},
+                },
+            },
+        }
+    )
+    config_path = tmp_path / "config_stage6_bad_motif.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="motif.source"):
+        load_config(config_path)
+
+
 def test_stage4_forces_contrastive_disabled_even_if_enabled_in_config(tmp_path: Path) -> None:
     config = _base_config()
     config.update(

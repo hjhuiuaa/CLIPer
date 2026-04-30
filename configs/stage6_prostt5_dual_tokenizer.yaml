@@ -1,13 +1,12 @@
-stage: stage5
+stage: stage6
 backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
-tokenizer_name: configs/prosite_tokenizer
 window_size: 1024
 batch_tokens: 2048
 optimizer: adamw
 lr: 0.00012
 weight_decay: 0.02
 max_epochs: 30
-early_stop_patience: 6
+early_stop_patience: 4
 seed: 42
 threshold_search:
   min: 0.05
@@ -35,11 +34,26 @@ classifier_head:
   kernel_size: 3
   dilations: [1, 2, 4]
 
-motif:
+dual_tokenizer:
   enabled: true
-  source: configs/prosite_motif_library_full.json
-  matching: prosite
-  tokenization: special_token
+  fusion: weighted_logits
+  branches:
+    plain:
+      weight: 0.5
+      tokenizer_name: null
+      motif:
+        enabled: false
+    special:
+      weight: 0.5
+      tokenizer_name: configs/prosite_tokenizer
+      motif:
+        enabled: true
+        source: configs/prosite_motif_library_full.json
+        matching: prosite
+        tokenization: special_token
+
+motif:
+  enabled: false
 
 contrastive:
   enabled: false
@@ -51,7 +65,7 @@ contrastive:
 train_fasta: dataset/disprot_202312_linker_label.fasta
 caid_fasta: dataset/linker.fasta
 split_manifest: artifacts/splits/disprot_split_seed42.json
-output_dir: artifacts/runs/stage5_prostt5_motif
+output_dir: artifacts/runs/stage6_prostt5_dual_tokenizer
 experiment_prefix: exp
 save_every: 500
 print_every: 20
@@ -64,5 +78,5 @@ wandb_entity: 3151599052-nankai-university
 wandb_project: CLIPer
 wandb_mode: online
 wandb_run_name: null
-wandb_group: stage5_prosite_special_token
-wandb_tags: [stage5, bce, prosite, special-token]
+wandb_group: stage6_dual_tokenizer
+wandb_tags: [stage6, bce, cnn, dual-tokenizer, weighted-logits]
