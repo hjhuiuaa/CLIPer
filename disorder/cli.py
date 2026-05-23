@@ -65,6 +65,21 @@ def build_parser() -> argparse.ArgumentParser:
     ex_parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision on CUDA.")
     ex_parser.add_argument("--overwrite", action="store_true", help="Recompute even if feature file exists.")
 
+    seq_parser = subparsers.add_parser(
+        "extract_sequence",
+        help="Extract one protein to <protein_id>.resfeat.txt (auto short/long encoding).",
+    )
+    seq_parser.add_argument("--output-dir", required=True, help="Directory for the output .resfeat.txt file.")
+    seq_parser.add_argument("--backbone", required=True, help="HF model id or path (e.g. Rostlab/ProstT5).")
+    seq_parser.add_argument("--protein-id", default=None, help="Protein id (with --sequence if --fasta omitted).")
+    seq_parser.add_argument("--sequence", default=None, help="Amino-acid sequence string.")
+    seq_parser.add_argument("--fasta", default=None, help="2-line FASTA with exactly one record.")
+    seq_parser.add_argument("--window-size", type=int, default=1024)
+    seq_parser.add_argument("--batch-size", type=int, default=1)
+    seq_parser.add_argument("--device", default="cuda")
+    seq_parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision on CUDA.")
+    seq_parser.add_argument("--overwrite", action="store_true", help="Recompute even if output file exists.")
+
     tf_parser = subparsers.add_parser(
         "train_features",
         help="Train disorder head on precomputed .resfeat.txt (paired 2-line + 3-line FASTA per split).",
@@ -137,6 +152,23 @@ def main(argv: list[str] | None = None) -> int:
             sequence_fasta=args.fasta,
             output_dir=args.output_dir,
             backbone_name=args.backbone,
+            batch_size=args.batch_size,
+            device=args.device,
+            mixed_precision=not args.no_amp,
+            overwrite=args.overwrite,
+        )
+    elif args.command == "extract_sequence":
+        from disorder.sequence_embedding import extract_sequence_embedding
+
+        if args.fasta is None and (args.protein_id is None or args.sequence is None):
+            parser.error("extract_sequence requires --fasta or both --protein-id and --sequence.")
+        result = extract_sequence_embedding(
+            protein_id=args.protein_id,
+            sequence=args.sequence,
+            fasta_path=args.fasta,
+            output_dir=args.output_dir,
+            backbone_name=args.backbone,
+            window_size=args.window_size,
             batch_size=args.batch_size,
             device=args.device,
             mixed_precision=not args.no_amp,

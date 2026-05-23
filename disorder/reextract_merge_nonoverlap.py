@@ -19,22 +19,17 @@ from typing import Any
 
 import torch
 
-from cliper.modeling import encode_sequences, load_backbone_and_tokenizer
+from cliper.modeling import load_backbone_and_tokenizer
 from cliper.windowing import normalize_sequence
 from disorder.data import parse_two_line_fasta
 from disorder.feature_io import FEATURE_FILE_SUFFIX, safe_feature_stem, write_residue_feature_file
+from disorder.sequence_embedding import encode_residue_embeddings, non_overlapping_window_starts
 
 _CHUNK_FILE_RE = re.compile(rf"^(.+)_(\d+){re.escape(FEATURE_FILE_SUFFIX)}$")
 
 
-def _autocast_context(device_type: str, enabled: bool):
-    return torch.amp.autocast(device_type=device_type, enabled=enabled)
-
-
 def _non_overlapping_starts(length: int, window_size: int) -> list[int]:
-    if length <= 0 or window_size <= 0:
-        raise ValueError("length and window_size must be positive")
-    return list(range(0, length, int(window_size)))
+    return non_overlapping_window_starts(length, window_size)
 
 
 def _collect_chunk_groups(features_dir: Path) -> dict[str, list[int]]:
@@ -111,22 +106,16 @@ def reextract_merge_nonoverlap(
 
         starts = _non_overlapping_starts(length, int(window_size))
 
-        windows = [sequence[s : s + int(window_size)] for s in starts]
-        ordered_vecs: list[torch.Tensor] = []
-
-        for batch_start in range(0, len(windows), max(1, int(batch_size))):
-            sub = windows[batch_start : batch_start + int(batch_size)]
-            encoded = encode_sequences(tokenizer, backbone_name, sub)
-            input_ids = encoded.input_ids.to(dev)
-            attention_mask = encoded.attention_mask.to(dev)
-            residue_lengths = encoded.residue_lengths
-            with _autocast_context(device_type=dev.type, enabled=use_amp):
-                outputs = backbone(input_ids=input_ids, attention_mask=attention_mask)
-            hidden = outputs.last_hidden_state
-            for row, seg_len in enumerate(residue_lengths):
-                ordered_vecs.append(hidden[row, :seg_len, :].detach().float().cpu())
-
-        full = torch.cat(ordered_vecs, dim=0)
+        full = encode_residue_embeddings(
+            sequence=sequence,
+            backbone=backbone,
+            tokenizer=tokenizer,
+            backbone_name=backbone_name,
+            window_size=int(window_size),
+            batch_size=int(batch_size),
+            device=dev,
+            mixed_precision=use_amp,
+        )
         if int(full.shape[0]) != length:
             raise RuntimeError(
                 f"Merged length mismatch for {protein_id}: emb_rows={full.shape[0]} seq_len={length}"
