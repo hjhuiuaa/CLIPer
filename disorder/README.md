@@ -59,23 +59,41 @@ Implementation: `sequence_embedding.py` (core), `extract_sequence_embedding.py` 
 
 ## Batch embedding (`extract_features`)
 
-2-line FASTA with many proteins → one `.resfeat.txt` per id (whole sequence encoded in one pass):
+2-line FASTA with **one or many** proteins → one `.resfeat.txt` per id in `--output-dir`.
+
+Uses the **same encoding as `extract_sequence`**:
+
+| Sequence length | Encoding |
+| --- | --- |
+| `L <= 1024` | One full-sequence ProstT5 forward pass |
+| `L > 1024` | Non-overlapping 1024-residue windows, concatenated to `[L, D]` |
 
 ```bash
 python -m disorder extract_features \
   --fasta disorder/data/train.fasta \
   --output-dir disorder/prostt5_features/train \
   --backbone /path/to/Rostlab-ProstT5 \
-  --batch-size 1 --device cuda
+  --window-size 1024 \
+  --batch-size 1 \
+  --device cuda
 ```
 
-For historical long-sequence pipelines (chunk → merge), see:
+Example multi-record FASTA:
 
-- `extract_features_chunked.py` — overlapping 1024 windows → `id_1.resfeat.txt`, `id_2.resfeat.txt`, …
-- `chunk_existing_features.py` — re-extract long ids from FASTA into chunk files
-- `reextract_merge_nonoverlap.py` — merge chunk stems back to one `id.resfeat.txt`
+```text
+>P04637
+MKTAYIAK...
+>P12345
+ACDEFGHIK...
+```
 
-**Prefer `extract_sequence` for new one-off or long-sequence work** — it skips intermediate chunk files.
+Outputs:
+
+- `disorder/prostt5_features/train/P04637.resfeat.txt`
+- `disorder/prostt5_features/train/P12345.resfeat.txt`
+- `disorder/prostt5_features/train/manifest.json`
+
+Legacy chunk/merge scripts (`extract_features_chunked`, `chunk_existing_features`, `reextract_merge_nonoverlap`) remain for old pipelines; **new work should use `extract_features` or `extract_sequence` directly.**
 
 ---
 

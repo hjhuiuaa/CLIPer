@@ -57,10 +57,16 @@ def build_parser() -> argparse.ArgumentParser:
         "extract_features",
         help="Run ProstT5 encoder on 2-line FASTA; write one .resfeat.txt per protein (one line per residue).",
     )
-    ex_parser.add_argument("--fasta", required=True, help="Unlabeled 2-line FASTA (>id, sequence).")
+    ex_parser.add_argument("--fasta", required=True, help="Unlabeled 2-line FASTA (>id, sequence); one or many records.")
     ex_parser.add_argument("--output-dir", required=True, help="Directory for *.resfeat.txt and manifest.json.")
     ex_parser.add_argument("--backbone", required=True, help="HF model id or path (e.g. Rostlab/ProstT5).")
-    ex_parser.add_argument("--batch-size", type=int, default=2)
+    ex_parser.add_argument("--window-size", type=int, default=1024, help="Window size for long-sequence encoding.")
+    ex_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for long-sequence window encoding (one protein processed at a time).",
+    )
     ex_parser.add_argument("--device", default="cuda")
     ex_parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision on CUDA.")
     ex_parser.add_argument("--overwrite", action="store_true", help="Recompute even if feature file exists.")
@@ -152,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             sequence_fasta=args.fasta,
             output_dir=args.output_dir,
             backbone_name=args.backbone,
+            window_size=args.window_size,
             batch_size=args.batch_size,
             device=args.device,
             mixed_precision=not args.no_amp,
