@@ -39,6 +39,57 @@ Stage 6 fuses ordinary ProstT5 tokenization with PROSITE special-token tokenizat
 - **Fusion:** validation, CAID3, and `eval` use `0.5 * plain_logits + 0.5 * special_logits`
 - **Default base:** Stage 4 T1 regularized CNN/local-context hyperparameters, plus Stage 5 PROSITE tokenizer assets
 
+## Project Status — CAID4 Submission (2026-05)
+
+**GitHub `main` is synced at commit `7156d3e` (`feat: add CAID stage4 predict CLI and submission bundle`).**
+
+### What is done (code + docs)
+
+| Item | Status | Location |
+| --- | --- | --- |
+| CAID4 predict CLI (`predict`) | Done | `cliper/cli.py`, `cliper/caid_predict.py`, `cliper/caid_io.py` |
+| Stage4 CNN + `concat_window` inference path | Done | reuses training window merge logic; CPU-only |
+| Precomputed embedding input (`.npy` / `.h5` / `.resfeat.txt`) | Done | `--embeddings-dir` |
+| CAID output writers (`.caid`, `timings.csv`) | Done | `cliper/caid_io.py` |
+| Reference predict config | Done | `configs/caid_stage4_predict.yaml` |
+| Docker + submission guide | Done | `submission/caid/` (see [`SUBMISSION.md`](submission/caid/SUBMISSION.md)) |
+| Smoke tests | Done | `tests/test_caid_predict.py` |
+
+**Submission model (locked):** `stage4_prostt5_cnn_concat_window_t1_regularized`  
+Do **not** use Stage 5/6 for the standard CAID flow — they need live ProstT5 + PROSITE special-token encoding, while CAID mounts **precomputed ProstT5 residue embeddings** at runtime.
+
+Expected checkpoint on the training server:
+
+```text
+artifacts/runs/stage4_prostt5_cnn_concat_window_t1_regularized/exp0001/checkpoints/best.pt
+```
+
+(`best.pt` is gitignored; copy manually into `submission/caid/models/` when packaging Docker.)
+
+### What teammates should do on the server (next steps)
+
+```bash
+cd /data/huggs/hujh/CLIPer
+git pull origin main
+git log -1 --oneline          # expect 7156d3e
+python -m cliper.cli predict --help
+```
+
+1. **Smoke test** — 2-line FASTA + existing ProstT5 embeddings → `.caid` + `timings.csv` (see [§5 predict CLI](#5-caid4-predict-offline-embeddings) below).
+2. **CPU profile** — run the **longest** target sequence; confirm runtime **< 6 h**, threads **≤ 24**, RAM **≤ 48 GB**.
+3. **Docker** — `docker build -f submission/caid/Dockerfile ...` and run on Linux CPU (details in [`submission/caid/SUBMISSION.md`](submission/caid/SUBMISSION.md)).
+4. **Submit** — push image / Dockerfile to CAID before **2026-05-31**; confirm flavor directory name `linker` with organizers.
+
+### Still open
+
+- [ ] Server repo updated (`git pull`)
+- [ ] Real `best.pt` smoke test on server
+- [ ] Longest-sequence CPU timing recorded
+- [ ] Docker build verified on clean Linux
+- [ ] CAID online form + organizer confirmation of `linker` flavor name
+
+Full checklist and compliance table: [`submission/caid/SUBMISSION.md`](submission/caid/SUBMISSION.md).
+
 ## Stage 1 Pipeline
 The implementation includes:
 - strict 3-line FASTA parsing (`>id`, sequence, label string)
@@ -282,7 +333,42 @@ python -m cliper.cli eval \
 不传 `--output-dir` 时，评测结果会自动保存到 checkpoint 所属实验目录下：
 `.../expXXXX/evaluations/evalXXXX/`
 
-### 4) Batch structure visualization from `predictions.tsv`
+### 5) CAID4 predict (offline embeddings)
+
+For **CAID4 submission**: reads a standard **2-line FASTA** (id + sequence, no labels), loads **precomputed ProstT5 embeddings** per protein, runs the **Stage 4 CNN head on CPU**, and writes CAID outputs.
+
+```bash
+python -m cliper.cli predict \
+  --checkpoint artifacts/runs/stage4_prostt5_cnn_concat_window_t1_regularized/exp0001/checkpoints/best.pt \
+  --fasta /path/to/targets.fasta \
+  --embeddings-dir /path/to/prostt5_embeddings \
+  --output-dir artifacts/caid_smoke \
+  --flavor linker \
+  --device cpu \
+  --num-threads 4
+```
+
+Outputs under `--output-dir`:
+
+- `{flavor}/{protein_id}.caid` — per-residue probability + binary label
+- `timings.csv` — per-sequence runtime (milliseconds)
+- `predict_summary.json` — run metadata for debugging
+
+Embedding file naming (first match under `--embeddings-dir`):
+
+| FASTA header | Examples |
+| --- | --- |
+| `>P04637` | `P04637.npy`, `P04637.h5`, `P04637.resfeat.txt` |
+
+Local benchmark FASTA `dataset/linker.fasta` is **3-line labeled**; convert to 2-line for predict tests:
+
+```bash
+awk 'NR%3==1 || NR%3==2' dataset/linker.fasta > /tmp/linker_seqonly.fasta
+```
+
+Docker entrypoint: `submission/caid/predict.sh`. Build/run instructions: [`submission/caid/SUBMISSION.md`](submission/caid/SUBMISSION.md).
+
+### 6) Batch structure visualization from `predictions.tsv`
 RCSB experimental structures are used first. If unavailable or coverage is too low, the workflow falls back to AlphaFold (when `--fallback alphafold`).
 
 ```bash
@@ -331,6 +417,8 @@ Visualization behavior:
 - Stage 3 (Transformer) config template: [`configs/stage3_prostt5_transformer.yaml`](configs/stage3_prostt5_transformer.yaml).
 - Stage 4 (CNN + concat_window) config template: [`configs/stage4_prostt5_cnn_concat_window.yaml`](configs/stage4_prostt5_cnn_concat_window.yaml).
 - Stage 4 (CNN T1 regularized) config template: [`configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml`](configs/stage4_prostt5_cnn_concat_window_t1_regularized.yaml).
+- CAID4 predict reference config: [`configs/caid_stage4_predict.yaml`](configs/caid_stage4_predict.yaml).
+- CAID4 submission bundle (Docker + checklist): [`submission/caid/SUBMISSION.md`](submission/caid/SUBMISSION.md).
 - Stage 4 (CNN T3 balanced) config template: [`configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml`](configs/stage4_prostt5_cnn_concat_window_t3_balanced.yaml).
 - Stage 5 PROSITE special-token config template: [`configs/stage5_prostt5_motif.yaml`](configs/stage5_prostt5_motif.yaml).
 - Stage 6 dual-tokenizer fusion config template: [`configs/stage6_prostt5_dual_tokenizer.yaml`](configs/stage6_prostt5_dual_tokenizer.yaml).
@@ -358,6 +446,8 @@ Representative CAID3 results from recent Stage 4 runs (single-run snapshots):
 
 Current best-performing family in these experiments: **Stage 4 CNN + concat_window**, especially
 `stage4_prostt5_cnn_concat_window_t1_regularized`.
+
+**CAID4 submission uses this same Stage 4 T1 regularized CNN checkpoint** (not Stage 5/6). See [Project Status — CAID4 Submission](#project-status--caid4-submission-2026-05).
 
 Notes:
 - These are single-run / few-seed observations, not final multi-seed averages.
