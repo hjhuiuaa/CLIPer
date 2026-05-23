@@ -26,7 +26,7 @@ Copy the best stage4 checkpoint from training:
 
 ```bash
 # On training server (example path)
-cp artifacts/runs/stage4_prostt5_cnn_concat_window_t1_regularized/exp0001/checkpoints/best.pt \
+cp artifacts/runs/stage4_prostt5_cnn_concat_window_t1/exp0001/checkpoints/best.pt \
    submission/caid/models/best.pt
 ```
 
@@ -39,13 +39,35 @@ The checkpoint must contain:
 
 ## 2. Local smoke test (before Docker)
 
-Export or copy ProstT5 embeddings for a few proteins (shape `[L, 1024]` per protein):
+### 2a. Export ProstT5 embeddings (linker / CAID)
+
+Use the **linker** CLI (not disorder). One 2-line FASTA can contain many proteins; each gets one file `[L, 1024]`.
+
+```bash
+# Convert internal 3-line benchmark FASTA to 2-line
+awk 'NR%3==1 || NR%3==2' dataset/linker.fasta > /tmp/linker_seqonly.fasta
+
+python -m cliper.cli extract_embeddings \
+  --fasta /tmp/linker_seqonly.fasta \
+  --output-dir artifacts/linker_prostt5_embeddings \
+  --backbone /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5 \
+  --window-size 1024 \
+  --batch-size 1 \
+  --device cuda \
+  --format resfeat
+```
+
+Outputs: `artifacts/linker_prostt5_embeddings/<protein_id>.resfeat.txt` and `manifest.json`.
+
+Optional NumPy format: add `--format npy` (also accepted by `predict`).
+
+### 2b. Run predict
 
 ```bash
 python -m cliper.cli predict \
-  --checkpoint artifacts/runs/stage4_prostt5_cnn_concat_window_t1_regularized/exp0001/checkpoints/best.pt \
-  --fasta dataset/linker.fasta \
-  --embeddings-dir /path/to/prostt5_embeddings \
+  --checkpoint artifacts/runs/stage4_prostt5_cnn_concat_window_t1/exp0001/checkpoints/best.pt \
+  --fasta /tmp/linker_seqonly.fasta \
+  --embeddings-dir artifacts/linker_prostt5_embeddings \
   --output-dir artifacts/caid_smoke \
   --device cpu \
   --num-threads 4

@@ -59,6 +59,8 @@ Implementation: `sequence_embedding.py` (core), `extract_sequence_embedding.py` 
 
 ## Batch embedding (`extract_features`)
 
+For **disorder IDR** only. Linker / CAID should use **`python -m cliper.cli extract_embeddings`** (see README / `submission/caid/SUBMISSION.md`).
+
 2-line FASTA with **one or many** proteins → one `.resfeat.txt` per id in `--output-dir`.
 
 Uses the **same encoding as `extract_sequence`**:

@@ -333,15 +333,36 @@ python -m cliper.cli eval \
 不传 `--output-dir` 时，评测结果会自动保存到 checkpoint 所属实验目录下：
 `.../expXXXX/evaluations/evalXXXX/`
 
-### 5) CAID4 predict (offline embeddings)
+### 5) CAID4 — export embeddings (`extract_embeddings`)
+
+Linker / CAID: one 2-line FASTA (many proteins allowed) → one embedding file per id.
+
+```bash
+awk 'NR%3==1 || NR%3==2' dataset/linker.fasta > /tmp/linker_seqonly.fasta
+
+python -m cliper.cli extract_embeddings \
+  --fasta /tmp/linker_seqonly.fasta \
+  --output-dir artifacts/linker_prostt5_embeddings \
+  --backbone /path/to/Rostlab-ProstT5 \
+  --window-size 1024 \
+  --device cuda
+```
+
+- L ≤ 1024: full-sequence ProstT5 encode  
+- L > 1024: non-overlapping 1024 windows concatenated to `[L, D]`  
+- `predict` then runs linker eval windows on these embeddings (classifier only)
+
+For disorder IDR workflows, use `python -m disorder extract_features` instead.
+
+### 6) CAID4 predict (offline embeddings)
 
 For **CAID4 submission**: reads a standard **2-line FASTA** (id + sequence, no labels), loads **precomputed ProstT5 embeddings** per protein, runs the **Stage 4 CNN head on CPU**, and writes CAID outputs.
 
 ```bash
 python -m cliper.cli predict \
-  --checkpoint artifacts/runs/stage4_prostt5_cnn_concat_window_t1_regularized/exp0001/checkpoints/best.pt \
-  --fasta /path/to/targets.fasta \
-  --embeddings-dir /path/to/prostt5_embeddings \
+  --checkpoint artifacts/runs/stage4_prostt5_cnn_concat_window_t1/exp0001/checkpoints/best.pt \
+  --fasta /tmp/linker_seqonly.fasta \
+  --embeddings-dir artifacts/linker_prostt5_embeddings \
   --output-dir artifacts/caid_smoke \
   --flavor linker \
   --device cpu \
@@ -368,7 +389,7 @@ awk 'NR%3==1 || NR%3==2' dataset/linker.fasta > /tmp/linker_seqonly.fasta
 
 Docker entrypoint: `submission/caid/predict.sh`. Build/run instructions: [`submission/caid/SUBMISSION.md`](submission/caid/SUBMISSION.md).
 
-### 6) Batch structure visualization from `predictions.tsv`
+### 6) Batch structure visualization
 RCSB experimental structures are used first. If unavailable or coverage is too low, the workflow falls back to AlphaFold (when `--fallback alphafold`).
 
 ```bash

@@ -74,6 +74,36 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--device", default="cpu", help="Inference device (CAID requires cpu).")
     predict_parser.add_argument("--num-threads", type=int, default=4, help="CPU threads (max 24).")
 
+    emb_parser = subparsers.add_parser(
+        "extract_embeddings",
+        help="Linker/CAID: export ProstT5 embeddings (one file per protein) for predict.",
+    )
+    emb_parser.add_argument(
+        "--fasta",
+        default=None,
+        help="2-line FASTA with one or many records (or use --protein-id + --sequence).",
+    )
+    emb_parser.add_argument("--protein-id", default=None, help="Single protein id (with --sequence).")
+    emb_parser.add_argument("--sequence", default=None, help="Single protein sequence string.")
+    emb_parser.add_argument("--output-dir", required=True, help="Directory for embedding files + manifest.json.")
+    emb_parser.add_argument("--backbone", required=True, help="HF model id or path (e.g. Rostlab/ProstT5).")
+    emb_parser.add_argument("--window-size", type=int, default=1024, help="Window size for long-sequence encoding.")
+    emb_parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for long-sequence window encoding.",
+    )
+    emb_parser.add_argument("--device", default="cuda")
+    emb_parser.add_argument("--no-amp", action="store_true", help="Disable mixed precision on CUDA.")
+    emb_parser.add_argument("--overwrite", action="store_true", help="Recompute even if output exists.")
+    emb_parser.add_argument(
+        "--format",
+        choices=("resfeat", "npy"),
+        default="resfeat",
+        help="Output format: .resfeat.txt (default) or .npy.",
+    )
+
     return parser
 
 
@@ -121,6 +151,39 @@ def main(argv: list[str] | None = None) -> int:
             device=args.device,
             num_threads=args.num_threads,
         )
+    elif args.command == "extract_embeddings":
+        from cliper.extract_embeddings import (
+            extract_prostt5_embedding_for_sequence,
+            extract_prostt5_embeddings_for_fasta,
+        )
+
+        if args.fasta is not None:
+            result = extract_prostt5_embeddings_for_fasta(
+                fasta_path=args.fasta,
+                output_dir=args.output_dir,
+                backbone_name=args.backbone,
+                window_size=args.window_size,
+                batch_size=args.batch_size,
+                device=args.device,
+                mixed_precision=not args.no_amp,
+                overwrite=args.overwrite,
+                output_format=args.format,
+            )
+        elif args.protein_id is not None and args.sequence is not None:
+            result = extract_prostt5_embedding_for_sequence(
+                protein_id=args.protein_id,
+                sequence=args.sequence,
+                output_dir=args.output_dir,
+                backbone_name=args.backbone,
+                window_size=args.window_size,
+                batch_size=args.batch_size,
+                device=args.device,
+                mixed_precision=not args.no_amp,
+                overwrite=args.overwrite,
+                output_format=args.format,
+            )
+        else:
+            parser.error("extract_embeddings requires --fasta or both --protein-id and --sequence.")
     else:
         parser.error(f"Unknown command: {args.command}")
         return 2
