@@ -1,0 +1,25 @@
+# CAID stage4 linker predictor — reference config (no hard-coded server paths).
+# Override paths via CLI flags or environment variables in Docker.
+
+stage: stage4
+window_size: 1024
+eval_stride: 512
+top_k_heuristic: 4
+dropout: 0.1
+
+local_context:
+  enabled: true
+  radius: 1
+  mode: concat_window
+  include_self: true
+
+classifier_head:
+  type: cnn
+  dropout: 0.30
+  activation: relu
+  conv_channels: [256, 256, 256]
+  kernel_size: 3
+  dilations: [1, 2, 4]
+
+# Checkpoint threshold is read from best.pt unless --threshold is passed.
+# Expected ProstT5 embedding hidden_size: 1024 (per-residue, shape [L, 1024]).

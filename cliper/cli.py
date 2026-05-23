@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from .caid_predict import predict_caid
 from .pipeline import evaluate, prepare_data, train
 
 
@@ -48,6 +49,31 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--threshold", type=float, default=None, help="Optional decision threshold override.")
     eval_parser.add_argument("--batch-size", type=int, default=None, help="Optional inference batch size override.")
 
+    predict_parser = subparsers.add_parser(
+        "predict",
+        help="CAID submission predict: 2-line FASTA + precomputed embeddings -> .caid + timings.csv",
+    )
+    predict_parser.add_argument("--checkpoint", required=True, help="Path to trained stage4 checkpoint (.pt).")
+    predict_parser.add_argument("--fasta", required=True, help="Input FASTA (2-line records, no labels).")
+    predict_parser.add_argument(
+        "--embeddings-dir",
+        required=True,
+        help="Directory with one embedding file per protein (.npy, .h5, or .resfeat.txt).",
+    )
+    predict_parser.add_argument("--output-dir", required=True, help="Output directory for CAID files.")
+    predict_parser.add_argument(
+        "--flavor",
+        default="linker",
+        help="CAID output flavor subdirectory (default: linker).",
+    )
+    predict_parser.add_argument("--threshold", type=float, default=None, help="Decision threshold override.")
+    predict_parser.add_argument("--window-size", type=int, default=None, help="Eval window size override.")
+    predict_parser.add_argument("--eval-stride", type=int, default=None, help="Eval stride override.")
+    predict_parser.add_argument("--top-k-heuristic", type=int, default=None, help="Heuristic window count override.")
+    predict_parser.add_argument("--window-batch-size", type=int, default=8, help="Window batch size for inference.")
+    predict_parser.add_argument("--device", default="cpu", help="Inference device (CAID requires cpu).")
+    predict_parser.add_argument("--num-threads", type=int, default=4, help="CPU threads (max 24).")
+
     return parser
 
 
@@ -79,6 +105,21 @@ def main(argv: list[str] | None = None) -> int:
             split_key=args.split_key,
             threshold=args.threshold,
             batch_size=args.batch_size,
+        )
+    elif args.command == "predict":
+        result = predict_caid(
+            checkpoint_path=args.checkpoint,
+            fasta_path=args.fasta,
+            embeddings_dir=args.embeddings_dir,
+            output_dir=args.output_dir,
+            flavor=args.flavor,
+            threshold=args.threshold,
+            window_size=args.window_size,
+            eval_stride=args.eval_stride,
+            top_k_heuristic=args.top_k_heuristic,
+            window_batch_size=args.window_batch_size,
+            device=args.device,
+            num_threads=args.num_threads,
         )
     else:
         parser.error(f"Unknown command: {args.command}")

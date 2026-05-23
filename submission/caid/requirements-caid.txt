@@ -1,0 +1,5 @@
+# Minimal runtime dependencies for CAID CPU inference (no training stack).
+torch>=2.2,<2.6
+numpy>=1.26
+pyyaml>=6.0
+h5py>=3.10
