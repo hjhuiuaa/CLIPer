@@ -27,6 +27,12 @@ Stage 4 extends Stage 3 with local residue-context concatenation and alternative
 - **Head options:** `mlp3` / `mlp5` / `mlp12` / `transformer` / `cnn`
 - **CNN head:** `conv_channels + dilations` Conv1d stack for residue-wise logits
 
+Stage 7 extends Stage 4 with sequence-level RNN heads for contiguous linker segments:
+- **Objective:** `BCEWithLogitsLoss` only (contrastive forced off, same as Stage 3/4)
+- **Local context:** same `concat_window` as Stage 4
+- **Head options:** `rnn` (bidirectional GRU/LSTM over concat-window features) or `crnn` (Stage 4-style CNN front-end + bidirectional RNN)
+- **Motivation:** linker labels are usually contiguous runs separated by long non-linker gaps; the RNN layer models residue-to-residue continuity along the sequence
+
 Stage 5 extends Stage 4 with native PROSITE motif special tokens:
 - **Objective:** `BCEWithLogitsLoss` only (contrastive forced off, same as Stage 3/4)
 - **Backbone policy:** reuse ProstT5 encoder with a saved tokenizer extended from the base tokenizer
@@ -161,6 +167,13 @@ python -m cliper.cli train --config configs/stage3_prostt5_transformer.yaml
 python -m cliper.cli train --config configs/stage4_prostt5_cnn_concat_window.yaml
 ```
 
+### 2f2) Train Stage 7 model (CNN + RNN head for contiguous linkers)
+```bash
+python -m cliper.cli train --config configs/stage7_prostt5_crnn_concat_window_t1.yaml
+# Pure RNN variant:
+python -m cliper.cli train --config configs/stage7_prostt5_rnn_concat_window_t1.yaml
+```
+
 ### 2g) Build Stage 5 PROSITE motif library and tokenizer
 ```bash
 python scripts/build_motif_library_from_profile.py \
@@ -240,6 +253,15 @@ Stage 4 additional configuration keys:
 - `classifier_head.kernel_size` (cnn, odd integer)
 - `classifier_head.dilations` (cnn; length must match `conv_channels`)
 
+Stage 7 additional configuration keys (same local context as Stage 4):
+- `stage: stage7`
+- `classifier_head.type: rnn | crnn`
+- `classifier_head.rnn_hidden_size`
+- `classifier_head.rnn_num_layers`
+- `classifier_head.rnn_type: gru | lstm`
+- `classifier_head.bidirectional`
+- `classifier_head.conv_channels` / `kernel_size` / `dilations` (crnn only)
+
 Stage 5 additional configuration keys:
 - `stage: stage5`
 - `tokenizer_name` (saved tokenizer extended from the base ProstT5 tokenizer)
@@ -262,7 +284,7 @@ Stage 6 additional configuration keys:
 - `dual_tokenizer.branches.special.motif.tokenization: special_token`
 
 Stage 3/4 runtime behavior:
-- If `stage: stage3` or `stage: stage4` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
+- If `stage: stage3`, `stage4`, or `stage7` and config sets `contrastive.enabled: true`, pipeline will force it to `false`.
 - Stage 3/4 loss remains pure BCE (`BCEWithLogitsLoss`) for controlled architecture-only validation.
 
 Stage 5 runtime behavior:

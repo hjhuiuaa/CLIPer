@@ -76,6 +76,7 @@ def _augment_with_local_context(feats: torch.Tensor, local_context: dict[str, An
 def infer_classifier_input_dim(model_state: dict[str, torch.Tensor]) -> int:
     preferred_keys = (
         "classifier.conv.0.weight",
+        "classifier.input_proj.weight",
         "classifier.network.0.weight",
         "classifier.classifier.weight",
         "classifier.weight",

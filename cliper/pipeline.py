@@ -124,6 +124,10 @@ DEFAULTS = {
         "conv_channels": [256, 256, 256],
         "kernel_size": 3,
         "dilations": [1, 2, 4],
+        "rnn_hidden_size": 256,
+        "rnn_num_layers": 2,
+        "rnn_type": "gru",
+        "bidirectional": True,
     },
     "local_context": {
         "enabled": False,
@@ -243,9 +247,10 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
     defaults.update(provided)
 
     head_type = str(defaults.get("type", "linear")).lower()
-    if head_type not in {"linear", "mlp3", "mlp5", "mlp12", "transformer", "cnn"}:
+    if head_type not in {"linear", "mlp3", "mlp5", "mlp12", "transformer", "cnn", "rnn", "crnn"}:
         raise ValueError(
-            "classifier_head.type must be one of ['linear', 'mlp3', 'mlp5', 'mlp12', 'transformer', 'cnn'], "
+            "classifier_head.type must be one of "
+            "['linear', 'mlp3', 'mlp5', 'mlp12', 'transformer', 'cnn', 'rnn', 'crnn'], "
             f"got {head_type!r}"
         )
     defaults["type"] = head_type
@@ -326,6 +331,43 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
         defaults["conv_channels"] = conv_channels
         defaults["kernel_size"] = kernel_size
         defaults["dilations"] = dilations
+    elif head_type in {"rnn", "crnn"}:
+        rnn_hidden_size = int(defaults.get("rnn_hidden_size", 256))
+        rnn_num_layers = int(defaults.get("rnn_num_layers", 2))
+        rnn_type = str(defaults.get("rnn_type", "gru")).lower()
+        bidirectional = bool(defaults.get("bidirectional", True))
+        if rnn_hidden_size <= 0:
+            raise ValueError(f"classifier_head.rnn_hidden_size must be > 0, got {rnn_hidden_size}")
+        if rnn_num_layers <= 0:
+            raise ValueError(f"classifier_head.rnn_num_layers must be > 0, got {rnn_num_layers}")
+        if rnn_type not in {"gru", "lstm"}:
+            raise ValueError(f"classifier_head.rnn_type must be one of ['gru', 'lstm'], got {rnn_type!r}")
+        defaults["rnn_hidden_size"] = rnn_hidden_size
+        defaults["rnn_num_layers"] = rnn_num_layers
+        defaults["rnn_type"] = rnn_type
+        defaults["bidirectional"] = bidirectional
+        if head_type == "crnn":
+            conv_channels = defaults.get("conv_channels", [256, 256])
+            if not isinstance(conv_channels, list) or len(conv_channels) == 0:
+                raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+            conv_channels = [int(ch) for ch in conv_channels]
+            if any(ch <= 0 for ch in conv_channels):
+                raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+            kernel_size = int(defaults.get("kernel_size", 3))
+            if kernel_size <= 0 or kernel_size % 2 == 0:
+                raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+            raw_dilations = defaults.get("dilations", [1, 2])
+            if not isinstance(raw_dilations, list) or len(raw_dilations) != len(conv_channels):
+                raise ValueError(
+                    "classifier_head.dilations must be a list with same length as conv_channels, "
+                    f"got dilations={raw_dilations!r}, conv_channels={conv_channels!r}"
+                )
+            dilations = [int(d) for d in raw_dilations]
+            if any(d <= 0 for d in dilations):
+                raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+            defaults["conv_channels"] = conv_channels
+            defaults["kernel_size"] = kernel_size
+            defaults["dilations"] = dilations
 
     return defaults
 
@@ -486,9 +528,9 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     merged.update(config)
     stage = str(merged.get("stage", "stage1")).lower()
-    if stage not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6"}:
+    if stage not in {"stage1", "stage2", "stage3", "stage4", "stage5", "stage6", "stage7"}:
         raise ValueError(
-            "stage must be one of ['stage1', 'stage2', 'stage3', 'stage4', 'stage5', 'stage6'], "
+            "stage must be one of ['stage1', 'stage2', 'stage3', 'stage4', 'stage5', 'stage6', 'stage7'], "
             f"got {stage!r}"
         )
     merged["stage"] = stage
@@ -500,7 +542,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged["dual_tokenizer"] = _resolve_dual_tokenizer_config(config, stage=stage)
     merged["stage_contrastive_forced_off"] = False
     merged["stage3_contrastive_forced_off"] = False
-    if stage in {"stage3", "stage4", "stage5", "stage6"} and bool(merged["contrastive"].get("enabled", False)):
+    if stage in {"stage3", "stage4", "stage5", "stage6", "stage7"} and bool(merged["contrastive"].get("enabled", False)):
         merged["contrastive"]["enabled"] = False
         merged["stage_contrastive_forced_off"] = True
         merged["stage3_contrastive_forced_off"] = True

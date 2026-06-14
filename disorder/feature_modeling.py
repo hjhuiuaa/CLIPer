@@ -7,7 +7,14 @@ from typing import Any
 import torch
 from torch import nn
 
-from cliper.modeling import CNNClassifierHead, MLPClassifierHead, TransformerClassifierHead, _build_padding_mask
+from cliper.modeling import (
+    CNNClassifierHead,
+    CRNNClassifierHead,
+    MLPClassifierHead,
+    RNNClassifierHead,
+    TransformerClassifierHead,
+    _build_padding_mask,
+)
 
 
 class DisorderFeatureClassifier(nn.Module):
@@ -82,6 +89,32 @@ class DisorderFeatureClassifier(nn.Module):
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 activation=str(classifier_cfg.get("activation", "relu")),
             )
+        elif head_type == "rnn":
+            self.classifier = RNNClassifierHead(
+                input_dim=hidden_size,
+                hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+            )
+        elif head_type == "crnn":
+            self.classifier = CRNNClassifierHead(
+                input_dim=hidden_size,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                rnn_hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                rnn_num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+            )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
 
@@ -93,6 +126,8 @@ class DisorderFeatureClassifier(nn.Module):
         if self.classifier_type == "transformer":
             padding_mask = _build_padding_mask(residue_lengths, max_len, device=x.device)
             logits = self.classifier(x, padding_mask=padding_mask).squeeze(-1)
+        elif self.classifier_type in {"rnn", "crnn"}:
+            logits = self.classifier(x, residue_lengths=residue_lengths).squeeze(-1)
         else:
             logits = self.classifier(x).squeeze(-1)
         return logits

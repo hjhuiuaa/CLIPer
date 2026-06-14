@@ -403,6 +403,204 @@ class TransformerClassifierHead(nn.Module):
         return self.classifier(encoded)
 
 
+def _build_rnn_module(
+    *,
+    rnn_type: str,
+    input_size: int,
+    hidden_size: int,
+    num_layers: int,
+    bidirectional: bool,
+    dropout: float,
+) -> nn.GRU | nn.LSTM:
+    """Construct a batch-first GRU/LSTM with validated hyperparameters."""
+    key = rnn_type.lower()
+    if key not in {"gru", "lstm"}:
+        raise ValueError(f"classifier_head.rnn_type must be one of ['gru', 'lstm'], got {rnn_type!r}")
+    if input_size <= 0:
+        raise ValueError(f"rnn input_size must be > 0, got {input_size}")
+    if hidden_size <= 0:
+        raise ValueError(f"classifier_head.rnn_hidden_size must be > 0, got {hidden_size}")
+    if num_layers <= 0:
+        raise ValueError(f"classifier_head.rnn_num_layers must be > 0, got {num_layers}")
+    rnn_cls = nn.GRU if key == "gru" else nn.LSTM
+    return rnn_cls(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+        bidirectional=bidirectional,
+        # Inter-layer dropout is only meaningful with stacked layers.
+        dropout=float(dropout) if num_layers > 1 else 0.0,
+    )
+
+
+def _run_rnn_over_residues(
+    rnn: nn.GRU | nn.LSTM,
+    x: torch.Tensor,
+    residue_lengths: list[int],
+) -> torch.Tensor:
+    """Run an RNN along the residue axis, ignoring padded tail positions.
+
+    Variable-length sequences are packed so the recurrence never consumes
+    padding, then re-padded back to the original [B, L, H_out] shape.
+    """
+    if x.dim() != 3:
+        raise ValueError(f"Expected [B, L, H] RNN input, got {tuple(x.shape)}")
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=x.device)
+    if lengths.numel() != x.shape[0]:
+        raise ValueError(
+            f"residue_lengths batch size {lengths.numel()} != input batch {x.shape[0]}"
+        )
+    if int(lengths.min().item()) <= 0:
+        raise ValueError(f"residue_lengths must be positive, got {residue_lengths!r}")
+    if int(lengths.max().item()) > x.shape[1]:
+        raise ValueError(
+            f"residue_lengths has value > sequence length ({x.shape[1]}): {residue_lengths!r}"
+        )
+    packed = nn.utils.rnn.pack_padded_sequence(
+        x,
+        lengths.cpu(),
+        batch_first=True,
+        enforce_sorted=False,
+    )
+    outputs, _ = rnn(packed)
+    outputs, _ = nn.utils.rnn.pad_packed_sequence(
+        outputs, batch_first=True, total_length=x.shape[1]
+    )
+    return outputs
+
+
+def _mask_padded_logits(logits: torch.Tensor, residue_lengths: list[int]) -> torch.Tensor:
+    """Zero out logits beyond each sequence's true length (hygiene for padded tails)."""
+    if logits.dim() != 3 or logits.shape[-1] != 1:
+        raise ValueError(f"Expected [B, L, 1] logits, got {tuple(logits.shape)}")
+    max_len = logits.shape[1]
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=logits.device)
+    valid = torch.arange(max_len, device=logits.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return logits * valid.unsqueeze(-1).to(logits.dtype)
+
+
+class RNNClassifierHead(nn.Module):
+    """Bidirectional RNN over per-residue features to favor contiguous linker segments.
+
+    A residue is rarely an isolated linker; linkers come in runs. A bidirectional
+    recurrence lets each position aggregate evidence from both neighboring directions
+    along the whole window, smoothing out spurious single-residue predictions.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        hidden_size: int,
+        num_layers: int,
+        rnn_type: str,
+        bidirectional: bool,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"rnn input_dim must be > 0, got {input_dim}")
+        self.input_proj = nn.Linear(input_dim, hidden_size)
+        self.input_dropout = nn.Dropout(dropout)
+        self.rnn = _build_rnn_module(
+            rnn_type=rnn_type,
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+        )
+        out_dim = hidden_size * (2 if bidirectional else 1)
+        self.norm = nn.LayerNorm(out_dim)
+        self.output_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(out_dim, 1)
+
+    def forward(self, x: torch.Tensor, *, residue_lengths: list[int]) -> torch.Tensor:
+        projected = self.input_dropout(self.input_proj(x))
+        encoded = _run_rnn_over_residues(self.rnn, projected, residue_lengths)
+        encoded = self.output_dropout(self.norm(encoded))
+        logits = self.classifier(encoded)
+        return _mask_padded_logits(logits, residue_lengths)
+
+
+class CRNNClassifierHead(nn.Module):
+    """CNN local features followed by a bidirectional RNN for sequence-level continuity.
+
+    The Conv1d stack captures local linker motifs (like Stage 4), while the RNN
+    propagates that signal across the sequence to enforce contiguity between regions.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        conv_channels: list[int],
+        kernel_size: int,
+        dilations: list[int] | None,
+        rnn_hidden_size: int,
+        rnn_num_layers: int,
+        rnn_type: str,
+        bidirectional: bool,
+        dropout: float,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"crnn input_dim must be > 0, got {input_dim}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+        if not conv_channels:
+            raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+        channels = [int(ch) for ch in conv_channels]
+        if any(ch <= 0 for ch in channels):
+            raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+        if dilations is None:
+            dils = [1] * len(channels)
+        else:
+            if len(dilations) != len(channels):
+                raise ValueError(
+                    "classifier_head.dilations length must match conv_channels length: "
+                    f"{len(dilations)} vs {len(channels)}"
+                )
+            dils = [int(d) for d in dilations]
+            if any(d <= 0 for d in dils):
+                raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+
+        layers: list[nn.Module] = []
+        in_ch = input_dim
+        for out_ch, dil in zip(channels, dils):
+            # Symmetric padding keeps the residue axis length unchanged.
+            pad = dil * (kernel_size - 1) // 2
+            layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, dilation=dil))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            in_ch = out_ch
+        self.conv = nn.Sequential(*layers)
+        self.rnn_dropout = nn.Dropout(dropout)
+        self.rnn = _build_rnn_module(
+            rnn_type=rnn_type,
+            input_size=channels[-1],
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+        )
+        out_dim = rnn_hidden_size * (2 if bidirectional else 1)
+        self.norm = nn.LayerNorm(out_dim)
+        self.output_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(out_dim, 1)
+
+    def forward(self, x: torch.Tensor, *, residue_lengths: list[int]) -> torch.Tensor:
+        # [B, L, H] -> [B, H, L] for conv1d along residues, then back to [B, L, C].
+        y = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        y = self.rnn_dropout(y)
+        encoded = _run_rnn_over_residues(self.rnn, y, residue_lengths)
+        encoded = self.output_dropout(self.norm(encoded))
+        logits = self.classifier(encoded)
+        return _mask_padded_logits(logits, residue_lengths)
+
+
 class CNNClassifierHead(nn.Module):
     def __init__(
         self,
@@ -540,6 +738,32 @@ class ResidueClassifier(nn.Module):
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 activation=str(classifier_cfg.get("activation", "relu")),
             )
+        elif head_type == "rnn":
+            self.classifier = RNNClassifierHead(
+                input_dim=classifier_input_dim,
+                hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+            )
+        elif head_type == "crnn":
+            self.classifier = CRNNClassifierHead(
+                input_dim=classifier_input_dim,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                rnn_hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                rnn_num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+            )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
 
@@ -585,6 +809,8 @@ class ResidueClassifier(nn.Module):
         if self.classifier_type == "transformer":
             padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
             logits = self.classifier(classifier_input, padding_mask=padding_mask).squeeze(-1)
+        elif self.classifier_type in {"rnn", "crnn"}:
+            logits = self.classifier(classifier_input, residue_lengths=residue_lengths).squeeze(-1)
         else:
             logits = self.classifier(classifier_input).squeeze(-1)
         if not return_embeddings:
