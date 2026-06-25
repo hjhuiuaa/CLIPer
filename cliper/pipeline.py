@@ -1969,6 +1969,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             evals_without_improve += 1
             log(f"[early-stop] no improvement count={evals_without_improve}/{early_stop_patience}")
 
+        # evaluate_records() sets model.eval(); cuDNN RNN heads require train mode for backward.
+        model.train()
+
     try:
         for epoch in range(start_epoch + 1, int(config["max_epochs"]) + 1):
             model.train()
