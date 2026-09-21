@@ -53,7 +53,13 @@ from .modeling import (
     load_backbone_and_tokenizer,
     prepare_backbone_for_motif_tokenizer,
 )
-from .windowing import build_eval_window_starts, merge_window_logits, sigmoid, training_crop
+from .windowing import (
+    build_eval_window_starts,
+    linker_probs_from_logits,
+    merge_window_logits,
+    sigmoid,
+    training_crop,
+)
 
 
 def _autocast_context(device_type: str, enabled: bool):
@@ -128,6 +134,7 @@ DEFAULTS = {
         "rnn_num_layers": 2,
         "rnn_type": "gru",
         "bidirectional": True,
+        "num_classes": 1,
     },
     "local_context": {
         "enabled": False,
@@ -369,6 +376,15 @@ def _resolve_classifier_head_config(config: dict[str, Any]) -> dict[str, Any]:
             defaults["kernel_size"] = kernel_size
             defaults["dilations"] = dilations
 
+    num_classes = int(defaults.get("num_classes", 1))
+    if num_classes < 1:
+        raise ValueError(f"classifier_head.num_classes must be >= 1, got {num_classes}")
+    if num_classes != 1 and head_type != "crnn":
+        raise ValueError(
+            f"classifier_head.num_classes={num_classes} is only supported for crnn heads, got type={head_type!r}"
+        )
+    defaults["num_classes"] = num_classes
+
     return defaults
 
 
@@ -542,7 +558,15 @@ def load_config(path: str | Path) -> dict[str, Any]:
     merged["dual_tokenizer"] = _resolve_dual_tokenizer_config(config, stage=stage)
     merged["stage_contrastive_forced_off"] = False
     merged["stage3_contrastive_forced_off"] = False
-    if stage in {"stage3", "stage4", "stage5", "stage6", "stage7"} and bool(merged["contrastive"].get("enabled", False)):
+    # Stage7 ternary (num_classes>1) keeps SupCon on IDR classes {0,1}; other stage3–7 runs still force off.
+    ternary_stage7_supcon = (
+        stage == "stage7" and int(merged["classifier_head"].get("num_classes", 1)) > 1
+    )
+    if (
+        stage in {"stage3", "stage4", "stage5", "stage6", "stage7"}
+        and bool(merged["contrastive"].get("enabled", False))
+        and not ternary_stage7_supcon
+    ):
         merged["contrastive"]["enabled"] = False
         merged["stage_contrastive_forced_off"] = True
         merged["stage3_contrastive_forced_off"] = True
@@ -1008,8 +1032,23 @@ def _restore_train_state_from_checkpoint(
     return restored
 
 
-def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> torch.Tensor:
+def _labels_to_tensor(
+    label_strings: list[str],
+    residue_lengths: list[int],
+    *,
+    num_classes: int = 1,
+) -> torch.Tensor:
     max_len = max(residue_lengths)
+    if num_classes > 1:
+        labels_tensor = torch.full((len(label_strings), max_len), -100, dtype=torch.long)
+        for row, (label_string, length) in enumerate(zip(label_strings, residue_lengths)):
+            for idx, char in enumerate(label_string[:length]):
+                if char in {"0", "1", "2"}:
+                    labels_tensor[row, idx] = int(char)
+                else:
+                    labels_tensor[row, idx] = -100
+        return labels_tensor
+
     labels_tensor = torch.full((len(label_strings), max_len), -100.0, dtype=torch.float32)
     for row, (label_string, length) in enumerate(zip(label_strings, residue_lengths)):
         for idx, char in enumerate(label_string[:length]):
@@ -1021,6 +1060,26 @@ def _labels_to_tensor(label_strings: list[str], residue_lengths: list[int]) -> t
                 labels_tensor[row, idx] = -100.0
     return labels_tensor
 
+
+def _compute_class_weights(records: list[ProteinRecord], num_classes: int) -> tuple[torch.Tensor, dict[str, int]]:
+    counts = [0] * num_classes
+    for rec in records:
+        for ch in rec.labels:
+            if ch in {"0", "1", "2"}:
+                class_id = int(ch)
+                if 0 <= class_id < num_classes:
+                    counts[class_id] += 1
+    if any(c <= 0 for c in counts):
+        raise ValueError(f"All classes must appear in training labels, got counts={counts}")
+    inv = [1.0 / c for c in counts]
+    mean_inv = sum(inv) / len(inv)
+    weights = [v / mean_inv for v in inv]
+    return torch.tensor(weights, dtype=torch.float32), {
+        "class_0_other_idr": counts[0],
+        "class_1_linker": counts[1],
+        "class_2_ordered": counts[2] if num_classes > 2 else 0,
+        "total": sum(counts),
+    }
 
 def _motif_special_token_batch(
     sequences: list[str],
@@ -1279,11 +1338,22 @@ def _batched_forward(
                     )
         logits = logits.detach().float().cpu()
         for row, length in enumerate(residue_lengths):
-            outputs.append(logits[row, :length].tolist())
+            row_logits = logits[row, :length]
+            outputs.append(row_logits.tolist())
     return outputs
 
 
-def _extract_scored_residues(labels: str, probs: list[float]) -> tuple[list[int], list[float]]:
+def _extract_scored_residues(
+    labels: str,
+    probs: list[float],
+    *,
+    protocol: str = "t1",
+) -> tuple[list[int], list[float]]:
+    """Map residue labels to binary linker scores.
+
+    protocol='t1': positive=1, negative={0,2} (ordered treated as negative)
+    protocol='t2': only score {0,1} residues (IDR-masked)
+    """
     y_true: list[int] = []
     y_prob: list[float] = []
     for char, prob in zip(labels, probs):
@@ -1291,6 +1361,9 @@ def _extract_scored_residues(labels: str, probs: list[float]) -> tuple[list[int]
             y_true.append(1)
             y_prob.append(prob)
         elif char == "0":
+            y_true.append(0)
+            y_prob.append(prob)
+        elif protocol == "t1" and char == "2":
             y_true.append(0)
             y_prob.append(prob)
         else:
@@ -1316,11 +1389,14 @@ def evaluate_records(
     threshold_search: dict[str, float],
     mixed_precision: bool,
     dual_tokenizer_runtime: dict[str, Any] | None = None,
+    num_classes: int = 1,
 ) -> dict[str, Any]:
     model.eval()
     per_record: list[tuple[str, str, list[float]]] = []
     y_true_all: list[int] = []
     y_prob_all: list[float] = []
+    y_true_t2: list[int] = []
+    y_prob_t2: list[float] = []
 
     for record in records:
         starts = build_eval_window_starts(
@@ -1347,11 +1423,15 @@ def evaluate_records(
             length=len(record.sequence),
             window_logits=list(zip(starts, window_logits)),
         )
-        probs = sigmoid(merged_logits)
+        probs = linker_probs_from_logits(merged_logits)
         per_record.append((record.protein_id, record.labels, probs))
-        true_slice, prob_slice = _extract_scored_residues(record.labels, probs)
+        true_slice, prob_slice = _extract_scored_residues(record.labels, probs, protocol="t1")
         y_true_all.extend(true_slice)
         y_prob_all.extend(prob_slice)
+        if num_classes > 1:
+            t2_true, t2_prob = _extract_scored_residues(record.labels, probs, protocol="t2")
+            y_true_t2.extend(t2_true)
+            y_prob_t2.extend(t2_prob)
 
     tuned_threshold = threshold
     best_f1 = 0.0
@@ -1373,17 +1453,23 @@ def evaluate_records(
     f1 = best_f1 if y_true_all and threshold is None else (f1_score(y_true_all, preds) if y_true_all else 0.0)
     mcc = best_mcc if y_true_all and threshold is None else (mcc_score(y_true_all, preds) if y_true_all else 0.0)
 
+    metrics: dict[str, Any] = {
+        "num_records": len(records),
+        "num_scored_residues": len(y_true_all),
+        "auprc": auprc,
+        "auroc": auroc,
+        "f1": f1,
+        "mcc": mcc,
+        "threshold": tuned_threshold,
+    }
+    if num_classes > 1:
+        metrics["auprc_t2"] = precision_recall_auc(y_true_t2, y_prob_t2) if y_true_t2 else 0.0
+        metrics["auroc_t2"] = binary_roc_auc(y_true_t2, y_prob_t2)
+        metrics["num_scored_residues_t2"] = len(y_true_t2)
+
     return {
         "threshold": tuned_threshold,
-        "metrics": {
-            "num_records": len(records),
-            "num_scored_residues": len(y_true_all),
-            "auprc": auprc,
-            "auroc": auroc,
-            "f1": f1,
-            "mcc": mcc,
-            "threshold": tuned_threshold,
-        },
+        "metrics": metrics,
         "per_record": per_record,
     }
 
@@ -1583,6 +1669,18 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         raise ValueError(f"Detected CAID3 leakage into train/val split. Example ids: {leakage[:10]}")
 
     pos_weight, class_stats = _compute_pos_weight(train_records)
+    num_classes = int(classifier_head_cfg.get("num_classes", 1))
+    class_weight_tensor: torch.Tensor | None = None
+    if num_classes > 1:
+        class_weight_tensor, class_stats = _compute_class_weights(train_records, num_classes)
+        pos_weight = 0.0
+        log(
+            "[ternary] class counts "
+            f"other_idr={class_stats['class_0_other_idr']} "
+            f"linker={class_stats['class_1_linker']} "
+            f"ordered={class_stats['class_2_ordered']} "
+            f"weights={class_weight_tensor.tolist()}"
+        )
 
     dual_tokenizer_runtime: dict[str, Any] | None = None
     if stage6_enabled:
@@ -1718,7 +1816,9 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 special_motif_specs=motif_specs,
                 special_motif_cfg=special_motif_cfg,
             )
-            label_tensor = _labels_to_tensor(labels, encoded_dual["residue_lengths"])
+            label_tensor = _labels_to_tensor(
+                labels, encoded_dual["residue_lengths"], num_classes=num_classes
+            )
             return {
                 "plain_input_ids": encoded_dual["plain"].input_ids,
                 "plain_attention_mask": encoded_dual["plain"].attention_mask,
@@ -1737,7 +1837,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             motif_specs=motif_specs,
             motif_cfg=motif_cfg,
         )
-        label_tensor = _labels_to_tensor(labels, encoded.residue_lengths)
+        label_tensor = _labels_to_tensor(labels, encoded.residue_lengths, num_classes=num_classes)
         return {
             "input_ids": encoded.input_ids,
             "attention_mask": encoded.attention_mask,
@@ -1756,8 +1856,17 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
 
     optimizer = AdamW(model.parameters(), lr=float(config["lr"]), weight_decay=float(config["weight_decay"]))
     scaler = _build_grad_scaler(enabled=use_amp)
-    pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction="none")
+    if num_classes > 1:
+        if class_weight_tensor is None:
+            raise RuntimeError("Ternary training requires class_weight_tensor.")
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weight_tensor.to(device),
+            ignore_index=-100,
+            reduction="mean",
+        )
+    else:
+        pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor, reduction="none")
     best_auroc = -1.0
     best_epoch = -1
     best_step = -1
@@ -1767,6 +1876,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     last_eval_metrics: dict[str, Any] = {}
     global_step = 0
     start_epoch = 0
+    selection_metric_name = "val_auprc_t2" if num_classes > 1 else "val_auroc"
 
     if resumed:
         history, print_history, eval_history = _load_history_if_exists(metrics_dir / "train_history.json", logger=log)
@@ -1818,19 +1928,33 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             f"best_val_auroc={best_auroc:.6f} best_threshold={best_threshold:.4f}"
         )
 
-    writer.add_scalar("data/class_positive", class_stats["positive"], global_step)
-    writer.add_scalar("data/class_negative", class_stats["negative"], global_step)
-    writer.add_scalar("train/pos_weight", pos_weight, global_step)
-    writer.add_scalar("train/contrastive_weight", contrastive_weight, global_step)
-    _wandb_log(
-        wandb_run,
-        {
+    if num_classes > 1:
+        writer.add_scalar("data/class_0_other_idr", class_stats["class_0_other_idr"], global_step)
+        writer.add_scalar("data/class_1_linker", class_stats["class_1_linker"], global_step)
+        writer.add_scalar("data/class_2_ordered", class_stats["class_2_ordered"], global_step)
+        class_log_payload = {
+            "data/class_0_other_idr": class_stats["class_0_other_idr"],
+            "data/class_1_linker": class_stats["class_1_linker"],
+            "data/class_2_ordered": class_stats["class_2_ordered"],
+            "train/pos_weight": pos_weight,
+            "train/contrastive_weight": contrastive_weight,
+            "run/stage": stage,
+        }
+    else:
+        writer.add_scalar("data/class_positive", class_stats["positive"], global_step)
+        writer.add_scalar("data/class_negative", class_stats["negative"], global_step)
+        class_log_payload = {
             "data/class_positive": class_stats["positive"],
             "data/class_negative": class_stats["negative"],
             "train/pos_weight": pos_weight,
             "train/contrastive_weight": contrastive_weight,
             "run/stage": stage,
-        },
+        }
+    writer.add_scalar("train/pos_weight", pos_weight, global_step)
+    writer.add_scalar("train/contrastive_weight", contrastive_weight, global_step)
+    _wandb_log(
+        wandb_run,
+        class_log_payload,
         step=global_step,
     )
     if motif_stats is not None:
@@ -1879,6 +2003,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             threshold_search=config["threshold_search"],
             mixed_precision=use_amp,
             dual_tokenizer_runtime=dual_tokenizer_runtime,
+            num_classes=num_classes,
         )
         train_metrics = train_result["metrics"]
 
@@ -1899,6 +2024,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             threshold_search=config["threshold_search"],
             mixed_precision=use_amp,
             dual_tokenizer_runtime=dual_tokenizer_runtime,
+            num_classes=num_classes,
         )
         val_metrics = val_result["metrics"]
         val_threshold = float(val_result["threshold"])
@@ -1920,6 +2046,10 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         writer.add_scalar("val/auprc", float(val_metrics["auprc"]), step)
         if val_metrics.get("auroc") is not None:
             writer.add_scalar("val/auroc", float(val_metrics["auroc"]), step)
+        if val_metrics.get("auprc_t2") is not None:
+            writer.add_scalar("val/auprc_t2", float(val_metrics["auprc_t2"]), step)
+        if val_metrics.get("auroc_t2") is not None:
+            writer.add_scalar("val/auroc_t2", float(val_metrics["auroc_t2"]), step)
         writer.add_scalar("val/f1", float(val_metrics["f1"]), step)
         writer.add_scalar("val/mcc", float(val_metrics["mcc"]), step)
         writer.add_scalar("val/threshold", float(val_threshold), step)
@@ -1934,19 +2064,33 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             wandb_eval_payload["train/auroc"] = float(train_metrics["auroc"])
         if val_metrics.get("auroc") is not None:
             wandb_eval_payload["val/auroc"] = float(val_metrics["auroc"])
+        if val_metrics.get("auprc_t2") is not None:
+            wandb_eval_payload["val/auprc_t2"] = float(val_metrics["auprc_t2"])
         _wandb_log(wandb_run, wandb_eval_payload, step=step)
+        t2_msg = ""
+        if val_metrics.get("auprc_t2") is not None:
+            t2_msg = (
+                f" val_auprc_t2={float(val_metrics['auprc_t2']):.6f} "
+                f"val_auroc_t2={_format_auroc_for_log(val_metrics.get('auroc_t2'))}"
+            )
         log(
             "[eval] "
             f"reason={reason} epoch={epoch} step={step} "
             f"train_auprc={train_metrics['auprc']:.6f} train_auroc={_format_auroc_for_log(train_metrics.get('auroc'))} "
             f"val_auprc={val_metrics['auprc']:.6f} val_auroc={_format_auroc_for_log(val_metrics.get('auroc'))} "
             f"f1={val_metrics['f1']:.6f} mcc={val_metrics['mcc']:.6f} "
-            f"threshold={val_threshold:.4f}"
+            f"threshold={val_threshold:.4f}{t2_msg}"
         )
 
-        val_auroc = val_metrics.get("auroc")
-        if val_auroc is not None and float(val_auroc) > best_auroc:
-            best_auroc = float(val_auroc)
+        if num_classes > 1:
+            selection_score = float(val_metrics.get("auprc_t2") or -1.0)
+            improved = selection_score > best_auroc
+        else:
+            val_auroc = val_metrics.get("auroc")
+            selection_score = float(val_auroc) if val_auroc is not None else -1.0
+            improved = val_auroc is not None and selection_score > best_auroc
+        if improved:
+            best_auroc = selection_score
             best_epoch = epoch
             best_step = step
             best_threshold = val_threshold
@@ -1964,7 +2108,10 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                 scaler=scaler,
                 train_state=_current_train_state(epoch),
             )
-            log(f"[best] updated best checkpoint at epoch={epoch}, step={step}, val_auroc={best_auroc:.6f}")
+            log(
+                f"[best] updated best checkpoint at epoch={epoch}, step={step}, "
+                f"{selection_metric_name}={best_auroc:.6f}"
+            )
         else:
             evals_without_improve += 1
             log(f"[early-stop] no improvement count={evals_without_improve}/{early_stop_patience}")
@@ -2038,14 +2185,25 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                                 token_residue_lengths=token_residue_lengths,
                             )
                             residue_embeddings = None
-                        mask = labels >= 0
-                        valid_count = int(mask.sum().item())
-                        if valid_count == 0:
-                            continue
-                        loss_matrix = criterion(logits, labels)
-                        bce_loss = (loss_matrix * mask).sum() / valid_count
-                        plain_bce_loss = bce_loss.new_zeros(())
-                        special_bce_loss = bce_loss.new_zeros(())
+                        if num_classes > 1:
+                            # CrossEntropy with ignore_index; logits [B,L,C], labels [B,L]
+                            flat_logits = logits.reshape(-1, num_classes)
+                            flat_labels = labels.reshape(-1)
+                            valid_count = int((flat_labels >= 0).sum().item())
+                            if valid_count == 0:
+                                continue
+                            bce_loss = criterion(flat_logits, flat_labels)
+                            plain_bce_loss = bce_loss.new_zeros(())
+                            special_bce_loss = bce_loss.new_zeros(())
+                        else:
+                            mask = labels >= 0
+                            valid_count = int(mask.sum().item())
+                            if valid_count == 0:
+                                continue
+                            loss_matrix = criterion(logits, labels)
+                            bce_loss = (loss_matrix * mask).sum() / valid_count
+                            plain_bce_loss = bce_loss.new_zeros(())
+                            special_bce_loss = bce_loss.new_zeros(())
 
                         contrastive_num_samples = 0
                         if contrastive_enabled and residue_embeddings is not None:
@@ -2330,6 +2488,7 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         threshold_search=config["threshold_search"],
         mixed_precision=use_amp,
         dual_tokenizer_runtime=dual_tokenizer_runtime,
+        num_classes=num_classes,
     )
     log(
         "[caid3] "
@@ -2631,6 +2790,7 @@ def evaluate(
     model.to(device)
 
     resolved_threshold = float(threshold) if threshold is not None else float(checkpoint.get("threshold", 0.5))
+    eval_num_classes = int(classifier_head_cfg.get("num_classes", 1))
     result = evaluate_records(
         model,
         tokenizer,
@@ -2648,6 +2808,7 @@ def evaluate(
         threshold_search=config["threshold_search"],
         mixed_precision=(device.type == "cuda"),
         dual_tokenizer_runtime=dual_tokenizer_runtime,
+        num_classes=eval_num_classes,
     )
     eval_wandb: dict[str, Any] = {
         "eval/auprc": float(result["metrics"]["auprc"]),

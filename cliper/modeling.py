@@ -472,8 +472,8 @@ def _run_rnn_over_residues(
 
 def _mask_padded_logits(logits: torch.Tensor, residue_lengths: list[int]) -> torch.Tensor:
     """Zero out logits beyond each sequence's true length (hygiene for padded tails)."""
-    if logits.dim() != 3 or logits.shape[-1] != 1:
-        raise ValueError(f"Expected [B, L, 1] logits, got {tuple(logits.shape)}")
+    if logits.dim() != 3 or logits.shape[-1] < 1:
+        raise ValueError(f"Expected [B, L, C] logits with C>=1, got {tuple(logits.shape)}")
     max_len = logits.shape[1]
     lengths = torch.tensor(residue_lengths, dtype=torch.long, device=logits.device)
     valid = torch.arange(max_len, device=logits.device).unsqueeze(0) < lengths.unsqueeze(1)
@@ -544,6 +544,7 @@ class CRNNClassifierHead(nn.Module):
         bidirectional: bool,
         dropout: float,
         activation: str,
+        num_classes: int = 1,
     ) -> None:
         super().__init__()
         if input_dim <= 0:
@@ -566,6 +567,10 @@ class CRNNClassifierHead(nn.Module):
             dils = [int(d) for d in dilations]
             if any(d <= 0 for d in dils):
                 raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+        num_classes = int(num_classes)
+        if num_classes < 1:
+            raise ValueError(f"classifier_head.num_classes must be >= 1, got {num_classes}")
+        self.num_classes = num_classes
 
         layers: list[nn.Module] = []
         in_ch = input_dim
@@ -589,7 +594,7 @@ class CRNNClassifierHead(nn.Module):
         out_dim = rnn_hidden_size * (2 if bidirectional else 1)
         self.norm = nn.LayerNorm(out_dim)
         self.output_dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(out_dim, 1)
+        self.classifier = nn.Linear(out_dim, num_classes)
 
     def forward(self, x: torch.Tensor, *, residue_lengths: list[int]) -> torch.Tensor:
         # [B, L, H] -> [B, H, L] for conv1d along residues, then back to [B, L, C].
@@ -763,10 +768,14 @@ class ResidueClassifier(nn.Module):
                 bidirectional=bool(classifier_cfg.get("bidirectional", True)),
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 activation=str(classifier_cfg.get("activation", "relu")),
+                num_classes=int(classifier_cfg.get("num_classes", 1)),
             )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
 
+        self.num_classes = int(getattr(self.classifier, "num_classes", 1))
+        if head_type != "crnn":
+            self.num_classes = 1
         self.projection_head = nn.Sequential(
             nn.Linear(classifier_input_dim, hidden_size),
             nn.ReLU(),
@@ -808,11 +817,15 @@ class ResidueClassifier(nn.Module):
         classifier_input = self.dropout(contextual_hidden)
         if self.classifier_type == "transformer":
             padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
-            logits = self.classifier(classifier_input, padding_mask=padding_mask).squeeze(-1)
+            raw_logits = self.classifier(classifier_input, padding_mask=padding_mask)
         elif self.classifier_type in {"rnn", "crnn"}:
-            logits = self.classifier(classifier_input, residue_lengths=residue_lengths).squeeze(-1)
+            raw_logits = self.classifier(classifier_input, residue_lengths=residue_lengths)
         else:
-            logits = self.classifier(classifier_input).squeeze(-1)
+            raw_logits = self.classifier(classifier_input)
+        if raw_logits.shape[-1] == 1:
+            logits = raw_logits.squeeze(-1)
+        else:
+            logits = raw_logits
         if not return_embeddings:
             return logits
         embeddings = self.projection_head(classifier_input)
@@ -900,7 +913,12 @@ def load_backbone_and_tokenizer(backbone_name: str, tokenizer_name: str | None =
         ) from exc
 
     tokenizer_source = tokenizer_name or backbone_name
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, do_lower_case=False)
+    # ProstT5 ships SentencePiece (spiece.model); slow tokenizer avoids fast-path Unigram errors in Docker.
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        do_lower_case=False,
+        use_fast=False,
+    )
     config = AutoConfig.from_pretrained(backbone_name)
     if getattr(config, "model_type", None) == "t5":
         backbone = T5EncoderModel.from_pretrained(backbone_name)

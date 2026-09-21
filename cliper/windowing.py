@@ -86,25 +86,55 @@ def build_eval_window_starts(
     return sorted(coverage.union(heuristic_starts))
 
 
-def merge_window_logits(length: int, window_logits: list[tuple[int, list[float]]]) -> list[float]:
-    """Merge overlapping window logits by mean value at each residue."""
-    total = [0.0] * length
-    counts = [0] * length
+def merge_window_logits(
+    length: int, window_logits: list[tuple[int, list[float] | list[list[float]]]]
+) -> list[float] | list[list[float]]:
+    """Merge overlapping window logits by mean value at each residue.
+
+    Supports binary logits (list[float] per window) and multi-class logits
+    (list[list[float]] with shape [L, C] per window).
+    """
+    if not window_logits:
+        return [0.0] * length
+    sample = window_logits[0][1]
+    multi = bool(sample) and isinstance(sample[0], (list, tuple))
+    if multi:
+        num_classes = len(sample[0])  # type: ignore[arg-type]
+        total = [[0.0] * num_classes for _ in range(length)]
+        counts = [0] * length
+        for start, logits in window_logits:
+            for offset, logit_vec in enumerate(logits):
+                position = start + offset
+                if position >= length:
+                    break
+                for c, value in enumerate(logit_vec):  # type: ignore[arg-type]
+                    total[position][c] += float(value)
+                counts[position] += 1
+        merged: list[list[float]] = []
+        for pos in range(length):
+            if counts[pos] == 0:
+                merged.append([0.0] * num_classes)
+            else:
+                merged.append([v / counts[pos] for v in total[pos]])
+        return merged
+
+    total_f = [0.0] * length
+    counts_f = [0] * length
     for start, logits in window_logits:
         for offset, logit in enumerate(logits):
             position = start + offset
             if position >= length:
                 break
-            total[position] += float(logit)
-            counts[position] += 1
+            total_f[position] += float(logit)  # type: ignore[arg-type]
+            counts_f[position] += 1
 
-    merged: list[float] = []
+    merged_f: list[float] = []
     for pos in range(length):
-        if counts[pos] == 0:
-            merged.append(0.0)
+        if counts_f[pos] == 0:
+            merged_f.append(0.0)
         else:
-            merged.append(total[pos] / counts[pos])
-    return merged
+            merged_f.append(total_f[pos] / counts_f[pos])
+    return merged_f
 
 
 def sigmoid(values: list[float]) -> list[float]:
@@ -118,3 +148,20 @@ def sigmoid(values: list[float]) -> list[float]:
             out.append(z / (1.0 + z))
     return out
 
+
+def linker_probs_from_logits(merged_logits: list[float] | list[list[float]]) -> list[float]:
+    """Convert merged logits to P(Linker). Binary uses sigmoid; multi-class uses softmax[..., 1]."""
+    if not merged_logits:
+        return []
+    if isinstance(merged_logits[0], (list, tuple)):
+        probs: list[float] = []
+        for logit_vec in merged_logits:  # type: ignore[assignment]
+            values = [float(x) for x in logit_vec]  # type: ignore[arg-type]
+            if len(values) < 2:
+                raise ValueError(f"Expected >=2 class logits for ternary head, got {values!r}")
+            peak = max(values)
+            exps = [math.exp(v - peak) for v in values]
+            denom = sum(exps)
+            probs.append(exps[1] / denom if denom > 0 else 0.0)
+        return probs
+    return sigmoid(merged_logits)  # type: ignore[arg-type]

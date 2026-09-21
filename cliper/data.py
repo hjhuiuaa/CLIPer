@@ -11,7 +11,7 @@ from typing import Any, Iterable
 import torch
 
 VALID_SEQUENCE_CHARS = set("ACDEFGHIKLMNPQRSTVWYBXZUO-")
-VALID_LABEL_CHARS = set("01-")
+VALID_LABEL_CHARS = set("012-")
 
 
 @dataclass(frozen=True)
