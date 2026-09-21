@@ -1,0 +1,46 @@
+# Patch an already-built CAID image to default MODE=runall (no pip / no ProstT5 re-copy).
+# Use when campus SSL blocks torch install.
+#
+#   docker tag cliper-linkcnn:latest cliper-linkcnn:pre-runall
+#   docker build -f submission/caid/Dockerfile.runall-patch \
+#     --build-arg BASE_IMAGE=cliper-linkcnn:pre-runall \
+#     --build-arg METHOD_NAME=CLIPer-LinkCNN \
+#     --build-arg METHOD_README=README-CLIPer-LinkCNN.txt \
+#     -t cliper-linkcnn:latest .
+
+ARG BASE_IMAGE=cliper-linkcnn:pre-runall
+FROM ${BASE_IMAGE}
+
+ARG METHOD_NAME=CLIPer-LinkCNN
+ARG METHOD_README=README-CLIPer-LinkCNN.txt
+
+LABEL org.opencontainers.image.title="${METHOD_NAME}"
+LABEL org.opencontainers.image.description="ProstT5 + linker runall (CAID4)"
+
+ENV MODE=runall \
+    PYTHONPATH=/app \
+    PROSTT5_MODEL=/app/models/Rostlab-ProstT5
+
+WORKDIR /app
+
+COPY cliper/__init__.py cliper/__main__.py cliper/cli.py \
+     cliper/caid_io.py cliper/caid_predict.py cliper/caid_runall.py \
+     cliper/extract_embeddings.py \
+     cliper/modeling.py cliper/windowing.py cliper/data.py \
+     /app/cliper/
+
+COPY submission/caid/runall.sh /app/runall.sh
+COPY submission/caid/predict.sh /app/predict.sh
+COPY submission/caid/extract_embeddings.sh /app/extract_embeddings.sh
+COPY submission/caid/entrypoint.sh /app/entrypoint.sh
+COPY submission/caid/dockerinout /app/dockerinout
+COPY submission/caid/${METHOD_README} /app/README.txt
+RUN chmod +x /app/runall.sh /app/predict.sh /app/extract_embeddings.sh /app/entrypoint.sh /app/dockerinout \
+ && cp /app/dockerinout /usr/local/bin/dockerinout \
+ && cp /app/README.txt /README.docker
+
+# Refresh stripped classifier if package script prepared it
+COPY submission/caid/models/best.pt /models/best.pt
+
+# Match flDPnn4a style: bash entrypoint; pass `dockerinout` explicitly.
+ENTRYPOINT ["/bin/bash"]

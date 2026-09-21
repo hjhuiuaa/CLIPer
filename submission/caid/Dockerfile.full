@@ -1,0 +1,99 @@
+# CLIPer CAID4 release image: full install from Python base.
+# Build (from repo root):
+#   ./scripts/package_caid_release.sh linkcnn
+#   REUSE_BASE=1 ./scripts/package_caid_release.sh linkcnn   # patch-only fallback
+#
+# Optional offline torch: place a Linux cp311 wheel in submission/caid/wheels/
+#   e.g. torch-2.6.0+cpu-cp311-cp311-linux_x86_64.whl
+
+ARG BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-slim-bookworm
+FROM ${BASE_IMAGE}
+
+ARG METHOD_NAME=CLIPer-LinkCNN
+ARG METHOD_README=README-CLIPer-LinkCNN.txt
+
+LABEL org.opencontainers.image.title="${METHOD_NAME}"
+LABEL org.opencontainers.image.description="ProstT5 + linker dockerinout (CAID4)"
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    OMP_NUM_THREADS=4 \
+    MKL_NUM_THREADS=4 \
+    PYTHONPATH=/app \
+    PROSTT5_MODEL=/app/models/Rostlab-ProstT5 \
+    MODE=runall
+
+COPY submission/caid/requirements-caid-full.txt /app/requirements-caid-full.txt
+
+ARG PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+
+# Local wheels directory may be empty; network install is the default path.
+COPY submission/caid/wheels/ /tmp/wheels/
+
+RUN set -eux; \
+    if ls /tmp/wheels/torch*.whl >/dev/null 2>&1; then \
+      echo "Installing torch from local wheel(s)"; \
+      pip install --no-cache-dir /tmp/wheels/torch*.whl; \
+    else \
+      echo "Installing torch==2.6.0 from network indexes"; \
+      pip install --no-cache-dir \
+        --trusted-host download.pytorch.org \
+        --trusted-host pypi.tuna.tsinghua.edu.cn \
+        --trusted-host files.pythonhosted.org \
+        --trusted-host pypi.org \
+        torch==2.6.0 --index-url "${TORCH_INDEX}" \
+      || pip install --no-cache-dir \
+        --trusted-host pypi.tuna.tsinghua.edu.cn \
+        --trusted-host files.pythonhosted.org \
+        --trusted-host pypi.org \
+        -i "${PIP_INDEX}" torch==2.6.0; \
+    fi; \
+    pip install --no-cache-dir \
+      --trusted-host pypi.tuna.tsinghua.edu.cn \
+      --trusted-host files.pythonhosted.org \
+      --trusted-host pypi.org \
+      -i "${PIP_INDEX}" -r /app/requirements-caid-full.txt; \
+    rm -rf /tmp/wheels
+
+# --- Minimal runtime code (no training pipeline / tests) ---
+RUN mkdir -p /app/cliper /app/disorder/data /app/configs
+COPY cliper/__init__.py cliper/__main__.py cliper/cli.py \
+     cliper/caid_io.py cliper/caid_predict.py cliper/caid_runall.py \
+     cliper/extract_embeddings.py \
+     cliper/modeling.py cliper/windowing.py cliper/data.py \
+     /app/cliper/
+COPY disorder/__init__.py disorder/feature_io.py disorder/feature_modeling.py \
+     disorder/sequence_embedding.py disorder/fasta_parsing.py \
+     /app/disorder/
+COPY disorder/data/__init__.py /app/disorder/data/__init__.py
+
+COPY configs/caid_stage4_predict.yaml /app/configs/caid_stage4_predict.yaml
+COPY configs/caid_stage7_predict.yaml /app/configs/caid_stage7_predict.yaml
+
+# ProstT5 weights + tokenizer (bundled; required for runall / dockerinout)
+COPY models/Rostlab-ProstT5/pytorch_model.bin \
+     models/Rostlab-ProstT5/config.json \
+     models/Rostlab-ProstT5/spiece.model \
+     models/Rostlab-ProstT5/tokenizer_config.json \
+     models/Rostlab-ProstT5/special_tokens_map.json \
+     models/Rostlab-ProstT5/added_tokens.json \
+     /app/models/Rostlab-ProstT5/
+
+COPY submission/caid/runall.sh /app/runall.sh
+COPY submission/caid/predict.sh /app/predict.sh
+COPY submission/caid/extract_embeddings.sh /app/extract_embeddings.sh
+COPY submission/caid/entrypoint.sh /app/entrypoint.sh
+COPY submission/caid/dockerinout /app/dockerinout
+COPY submission/caid/${METHOD_README} /app/README.txt
+RUN chmod +x /app/runall.sh /app/predict.sh /app/extract_embeddings.sh /app/entrypoint.sh /app/dockerinout \
+ && cp /app/dockerinout /usr/local/bin/dockerinout \
+ && cp /app/README.txt /README.docker
+
+COPY submission/caid/models/best.pt /models/best.pt
+
+# flDPnn4a-style: bash entrypoint; pass `dockerinout` explicitly.
+ENTRYPOINT ["/bin/bash"]

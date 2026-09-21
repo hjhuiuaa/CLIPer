@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# flDPnn4a-style I/O: FASTA on stdin -> gzip tar of CAID outputs on stdout.
+# Usage:
+#   docker run -i IMAGE dockerinout < targets.fasta > results.tar.gz
+set -euo pipefail
+
+WORKDIR="${WORKDIR:-/tmp/cliper_dockerinout}"
+rm -rf "${WORKDIR}"
+mkdir -p "${WORKDIR}/input" "${WORKDIR}/output"
+
+# Read FASTA from stdin
+cat > "${WORKDIR}/input/targets.fasta"
+if [[ ! -s "${WORKDIR}/input/targets.fasta" ]]; then
+  echo "dockerinout: empty stdin; provide FASTA via '< file.fasta'" >&2
+  exit 1
+fi
+
+export FASTA="${WORKDIR}/input/targets.fasta"
+export OUTPUT_DIR="${WORKDIR}/output"
+export MODE=runall
+export NUM_THREADS="${NUM_THREADS:-4}"
+export OMP_NUM_THREADS="${NUM_THREADS}"
+export MKL_NUM_THREADS="${NUM_THREADS}"
+
+# Keep predictor logs off stdout so the tar stream stays clean
+/app/runall.sh >/dev/null
+
+cd "${WORKDIR}/output"
+if [[ ! -f timings.csv ]]; then
+  echo "dockerinout: timings.csv missing after runall" >&2
+  exit 1
+fi
+if [[ ! -d linker ]] || ! compgen -G "linker/*.caid" >/dev/null; then
+  echo "dockerinout: no linker/*.caid outputs after runall" >&2
+  exit 1
+fi
+
+# CAID layout only: linker/*.caid + timings.csv
+tar -czf - linker timings.csv
