@@ -4,7 +4,6 @@ import argparse
 import json
 
 from .caid_predict import predict_caid
-from .pipeline import evaluate, prepare_data, train
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,6 +103,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output format: .resfeat.txt (default) or .npy.",
     )
 
+    runall_parser = subparsers.add_parser(
+        "runall",
+        help="CAID end-to-end: ProstT5 extract + predict; timings include extract.",
+    )
+    runall_parser.add_argument("--checkpoint", required=True, help="Classifier checkpoint (.pt).")
+    runall_parser.add_argument("--fasta", required=True, help="2-line FASTA input.")
+    runall_parser.add_argument("--output-dir", required=True, help="Output directory.")
+    runall_parser.add_argument("--backbone", required=True, help="Local ProstT5 path or Hub id.")
+    runall_parser.add_argument(
+        "--embeddings-dir",
+        default=None,
+        help="Only used with --keep-embeddings (default: OUTPUT_DIR/embeddings).",
+    )
+    runall_parser.add_argument("--flavor", default="linker")
+    runall_parser.add_argument("--threshold", type=float, default=None)
+    runall_parser.add_argument("--window-size", type=int, default=1024, help="ProstT5 encode window.")
+    runall_parser.add_argument("--eval-window-size", type=int, default=None, help="Classifier eval window.")
+    runall_parser.add_argument("--eval-stride", type=int, default=None)
+    runall_parser.add_argument("--top-k-heuristic", type=int, default=None)
+    runall_parser.add_argument("--window-batch-size", type=int, default=8)
+    runall_parser.add_argument("--extract-batch-size", type=int, default=1)
+    runall_parser.add_argument("--device", default="cpu")
+    runall_parser.add_argument("--num-threads", type=int, default=4)
+    runall_parser.add_argument(
+        "--keep-embeddings",
+        action="store_true",
+        help="Also write embeddings under OUTPUT_DIR/embeddings (debug only; off by default).",
+    )
+
+    t2_parser = subparsers.add_parser(
+        "runall_t2_balanced",
+        help="Build balanced ternary data, ProstT5 extract, contrastive train; timings + train/val/test AUROC.",
+    )
+    t2_parser.add_argument(
+        "--config",
+        default="configs/stage7_expl/stage7_prostt5_crnn_expl_a1_t2_balanced.yaml",
+    )
+    t2_parser.add_argument("--backbone", required=True, help="Local ProstT5 path (no AlphaFold).")
+    t2_parser.add_argument("--output-dir", required=True)
+    t2_parser.add_argument("--device", default="cuda")
+    t2_parser.add_argument("--extract-window-size", type=int, default=1024)
+    t2_parser.add_argument("--extract-batch-size", type=int, default=1)
+    t2_parser.add_argument("--overwrite-embeddings", action="store_true")
+    t2_parser.add_argument("--rebuild-data", action="store_true")
+    t2_parser.add_argument("--embeddings-format", choices=("npy", "resfeat"), default="npy")
+
+    seqneg_parser = subparsers.add_parser(
+        "runall_t2_seqneg",
+        help="All linker sequences + equal disorder-only sequences; dual binary heads; T1/T2 AUROC.",
+    )
+    seqneg_parser.add_argument(
+        "--config",
+        default="configs/stage7_expl/stage7_prostt5_crnn_expl_a1_t2_seqneg.yaml",
+    )
+    seqneg_parser.add_argument("--backbone", required=True, help="Local ProstT5 path (no AlphaFold).")
+    seqneg_parser.add_argument("--output-dir", required=True)
+    seqneg_parser.add_argument("--device", default="cuda")
+    seqneg_parser.add_argument("--extract-window-size", type=int, default=1024)
+    seqneg_parser.add_argument("--extract-batch-size", type=int, default=1)
+    seqneg_parser.add_argument("--overwrite-embeddings", action="store_true")
+    seqneg_parser.add_argument("--rebuild-data", action="store_true")
+    seqneg_parser.add_argument("--embeddings-format", choices=("npy", "resfeat"), default="npy")
+
     return parser
 
 
@@ -112,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "prepare_data":
+        from .pipeline import prepare_data
+
         result = prepare_data(
             fasta_path=args.fasta,
             error_file=args.error_file,
@@ -122,11 +186,15 @@ def main(argv: list[str] | None = None) -> int:
             exclusion_out=args.output_exclusion,
         )
     elif args.command == "train":
+        from .pipeline import train
+
         result = train(
             config_path=args.config,
             resume_checkpoint=args.resume_checkpoint,
         )
     elif args.command == "eval":
+        from .pipeline import evaluate
+
         result = evaluate(
             checkpoint_path=args.checkpoint,
             fasta_path=args.fasta,
@@ -184,6 +252,55 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             parser.error("extract_embeddings requires --fasta or both --protein-id and --sequence.")
+    elif args.command == "runall":
+        from cliper.caid_runall import runall_caid
+
+        result = runall_caid(
+            checkpoint_path=args.checkpoint,
+            fasta_path=args.fasta,
+            output_dir=args.output_dir,
+            backbone_name=args.backbone,
+            flavor=args.flavor,
+            embeddings_dir=args.embeddings_dir,
+            threshold=args.threshold,
+            window_size=args.window_size,
+            eval_window_size=args.eval_window_size,
+            eval_stride=args.eval_stride,
+            top_k_heuristic=args.top_k_heuristic,
+            window_batch_size=args.window_batch_size,
+            extract_batch_size=args.extract_batch_size,
+            device=args.device,
+            num_threads=args.num_threads,
+            keep_embeddings=bool(args.keep_embeddings),
+        )
+    elif args.command == "runall_t2_balanced":
+        from cliper.t2_balanced_runall import runall_t2_balanced
+
+        result = runall_t2_balanced(
+            config_path=args.config,
+            backbone_name=args.backbone,
+            output_dir=args.output_dir,
+            device=args.device,
+            extract_window_size=args.extract_window_size,
+            extract_batch_size=args.extract_batch_size,
+            overwrite_embeddings=bool(args.overwrite_embeddings),
+            rebuild_data=bool(args.rebuild_data),
+            embeddings_format=args.embeddings_format,
+        )
+    elif args.command == "runall_t2_seqneg":
+        from cliper.t2_seqneg_runall import runall_t2_seqneg
+
+        result = runall_t2_seqneg(
+            config_path=args.config,
+            backbone_name=args.backbone,
+            output_dir=args.output_dir,
+            device=args.device,
+            extract_window_size=args.extract_window_size,
+            extract_batch_size=args.extract_batch_size,
+            overwrite_embeddings=bool(args.overwrite_embeddings),
+            rebuild_data=bool(args.rebuild_data),
+            embeddings_format=args.embeddings_format,
+        )
     else:
         parser.error(f"Unknown command: {args.command}")
         return 2

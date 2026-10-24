@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Literal
 
 import numpy as np
 import torch
 
-from cliper.caid_io import parse_caid_fasta, sanitize_sequence
+from cliper.caid_io import parse_caid_fasta, sanitize_sequence, write_timings_csv
 from cliper.modeling import load_backbone_and_tokenizer
 from disorder.feature_io import (
     FEATURE_FILE_SUFFIX,
     feature_file_path,
+    safe_feature_stem,
     write_feature_manifest,
     write_residue_feature_file,
 )
@@ -22,10 +24,9 @@ OutputFormat = Literal["resfeat", "npy"]
 
 
 def _embedding_output_path(output_dir: Path, protein_id: str, fmt: OutputFormat) -> Path:
-    stem = feature_file_path(output_dir, protein_id).stem
     if fmt == "npy":
-        return output_dir / f"{stem}.npy"
-    return output_dir / f"{stem}{FEATURE_FILE_SUFFIX}"
+        return output_dir / f"{safe_feature_stem(protein_id)}.npy"
+    return feature_file_path(output_dir, protein_id)
 
 
 def _write_embedding(path: Path, embeddings: torch.Tensor, fmt: OutputFormat) -> None:
@@ -80,12 +81,15 @@ def extract_prostt5_embeddings_for_fasta(
     short_count = 0
     long_count = 0
     written_paths: list[str] = []
+    timings_ms: list[tuple[str, int]] = []
 
     for protein_id, sequence in records:
         seq = sanitize_sequence(sequence)
         target = _embedding_output_path(out_dir, protein_id, fmt)  # type: ignore[arg-type]
+        started = time.perf_counter()
         if target.exists() and not overwrite:
             skipped += 1
+            timings_ms.append((protein_id, 0))
             continue
 
         embeddings = encode_residue_embeddings(
@@ -99,12 +103,16 @@ def extract_prostt5_embeddings_for_fasta(
             mixed_precision=use_amp,
         )
         _write_embedding(target, embeddings, fmt)  # type: ignore[arg-type]
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        timings_ms.append((protein_id, elapsed_ms))
         written += 1
         written_paths.append(str(target.resolve()))
         if len(seq) <= int(window_size):
             short_count += 1
         else:
             long_count += 1
+
+    write_timings_csv(out_dir / "timings.csv", timings_ms)
 
     manifest_extra = {
         "task": "linker_caid",
@@ -133,6 +141,8 @@ def extract_prostt5_embeddings_for_fasta(
         "window_size": int(window_size),
         "output_format": fmt,
         "written_files": written_paths,
+        "timings_csv": str((out_dir / "timings.csv").resolve()),
+        "timings_ms": timings_ms,
     }
 
 

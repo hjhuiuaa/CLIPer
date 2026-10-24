@@ -666,6 +666,7 @@ class ResidueClassifier(nn.Module):
         dropout: float = 0.1,
         freeze_backbone: bool = True,
         projection_dim: int = 128,
+        proj_hidden: int | None = None,
         classifier_head: dict[str, Any] | None = None,
         local_context: dict[str, Any] | None = None,
         motif: dict[str, Any] | None = None,
@@ -776,10 +777,13 @@ class ResidueClassifier(nn.Module):
         self.num_classes = int(getattr(self.classifier, "num_classes", 1))
         if head_type != "crnn":
             self.num_classes = 1
+        proj_mid = hidden_size if proj_hidden is None else int(proj_hidden)
+        if proj_mid <= 0:
+            raise ValueError(f"proj_hidden must be > 0, got {proj_mid}")
         self.projection_head = nn.Sequential(
-            nn.Linear(classifier_input_dim, hidden_size),
+            nn.Linear(classifier_input_dim, proj_mid),
             nn.ReLU(),
-            nn.Linear(hidden_size, projection_dim),
+            nn.Linear(proj_mid, projection_dim),
         )
         if self.freeze_backbone:
             for param in self.backbone.parameters():
@@ -787,32 +791,52 @@ class ResidueClassifier(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        residue_lengths: list[int],
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        residue_lengths: list[int] | None = None,
         *,
+        residue_hidden: torch.Tensor | None = None,
         token_residue_lengths: list[list[int]] | None = None,
         return_embeddings: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        keep_backbone_graph = self.motif_enabled and token_residue_lengths is not None
-        if self.freeze_backbone:
-            self.backbone.eval()
-        if self.freeze_backbone and not keep_backbone_graph:
-            with torch.no_grad():
+        if residue_hidden is not None:
+            if residue_hidden.dim() != 3:
+                raise ValueError(
+                    f"residue_hidden must be [B, L, H], got shape={tuple(residue_hidden.shape)}"
+                )
+            if residue_lengths is None:
+                residue_lengths = [int(residue_hidden.shape[1])] * int(residue_hidden.shape[0])
+            max_len = max(residue_lengths)
+            if residue_hidden.shape[1] < max_len:
+                raise ValueError(
+                    f"residue_hidden length {residue_hidden.shape[1]} is smaller than "
+                    f"requested residue length {max_len}."
+                )
+            residue_hidden = residue_hidden[:, :max_len, :]
+        else:
+            if input_ids is None or attention_mask is None or residue_lengths is None:
+                raise ValueError(
+                    "forward requires either residue_hidden or (input_ids, attention_mask, residue_lengths)."
+                )
+            keep_backbone_graph = self.motif_enabled and token_residue_lengths is not None
+            if self.freeze_backbone:
+                self.backbone.eval()
+            if self.freeze_backbone and not keep_backbone_graph:
+                with torch.no_grad():
+                    outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            else:
                 outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-        else:
-            outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
 
-        hidden = outputs.last_hidden_state
-        max_len = max(residue_lengths)
-        if token_residue_lengths is not None:
-            residue_hidden = _broadcast_token_hidden_to_residues(hidden, token_residue_lengths, residue_lengths)
-        elif hidden.shape[1] < max_len:
-            raise ValueError(
-                f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
-            )
-        else:
-            residue_hidden = hidden[:, :max_len, :]
+            hidden = outputs.last_hidden_state
+            max_len = max(residue_lengths)
+            if token_residue_lengths is not None:
+                residue_hidden = _broadcast_token_hidden_to_residues(hidden, token_residue_lengths, residue_lengths)
+            elif hidden.shape[1] < max_len:
+                raise ValueError(
+                    f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
+                )
+            else:
+                residue_hidden = hidden[:, :max_len, :]
         contextual_hidden = _concat_local_window(residue_hidden, residue_lengths, self.local_context)
         classifier_input = self.dropout(contextual_hidden)
         if self.classifier_type == "transformer":

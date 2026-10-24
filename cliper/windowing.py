@@ -15,13 +15,20 @@ def normalize_sequence(sequence: str) -> str:
     return "".join(replacements.get(ch, ch) for ch in seq)
 
 
-def training_crop(sequence: str, labels: str, window_size: int, *, seed: int) -> tuple[str, str, int]:
+def training_crop(
+    sequence: str,
+    labels: str,
+    window_size: int,
+    *,
+    seed: int,
+    positive_chars: str = "1",
+) -> tuple[str, str, int]:
     """Return one training crop with linker-centered policy for long sequences."""
     length = len(sequence)
     if length <= window_size:
         return sequence, labels, 0
 
-    positives = [idx for idx, char in enumerate(labels) if char == "1"]
+    positives = [idx for idx, char in enumerate(labels) if char in set(positive_chars)]
     if positives:
         left = positives[0]
         right = positives[-1]
@@ -149,19 +156,33 @@ def sigmoid(values: list[float]) -> list[float]:
     return out
 
 
-def linker_probs_from_logits(merged_logits: list[float] | list[list[float]]) -> list[float]:
-    """Convert merged logits to P(Linker). Binary uses sigmoid; multi-class uses softmax[..., 1]."""
+def linker_probs_from_logits(
+    merged_logits: list[float] | list[list[float]],
+    *,
+    linker_class: int = 1,
+    dual_binary: bool = False,
+) -> list[float]:
+    """Convert merged logits to P(Linker).
+
+    Binary uses sigmoid. Dual-binary uses sigmoid of channel 0 (linker vs rest).
+    Softmax multi-class uses softmax[linker_class].
+    """
     if not merged_logits:
         return []
     if isinstance(merged_logits[0], (list, tuple)):
+        if dual_binary:
+            return sigmoid([float(vec[0]) for vec in merged_logits])  # type: ignore[index,arg-type]
+        class_index = int(linker_class)
         probs: list[float] = []
         for logit_vec in merged_logits:  # type: ignore[assignment]
             values = [float(x) for x in logit_vec]  # type: ignore[arg-type]
-            if len(values) < 2:
-                raise ValueError(f"Expected >=2 class logits for ternary head, got {values!r}")
+            if class_index < 0 or class_index >= len(values):
+                raise ValueError(
+                    f"linker_class={class_index} out of range for {len(values)}-way logits {values!r}"
+                )
             peak = max(values)
             exps = [math.exp(v - peak) for v in values]
             denom = sum(exps)
-            probs.append(exps[1] / denom if denom > 0 else 0.0)
+            probs.append(exps[class_index] / denom if denom > 0 else 0.0)
         return probs
     return sigmoid(merged_logits)  # type: ignore[arg-type]
