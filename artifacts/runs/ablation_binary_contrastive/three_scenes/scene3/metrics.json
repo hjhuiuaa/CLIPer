@@ -1,0 +1,8 @@
+{
+  "protocol": "protein contains a linker; score = max sliding-window mean",
+  "window": 18,
+  "num_proteins": 62,
+  "num_positives": 31,
+  "num_negatives": 31,
+  "auroc": 0.7273673257023934
+}

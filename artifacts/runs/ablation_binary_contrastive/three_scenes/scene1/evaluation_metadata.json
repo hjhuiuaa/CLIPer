@@ -1,0 +1,61 @@
+{
+  "checkpoint_path": "artifacts/runs/ablation_binary_contrastive/train/exp0001/checkpoints/best.pt",
+  "experiment_dir": "/data/huggs/hujh/CLIPer/artifacts/runs/ablation_binary_contrastive/train/exp0001",
+  "output_dir": "artifacts/runs/ablation_binary_contrastive/three_scenes/scene1",
+  "eval_id": null,
+  "tensorboard_service": {
+    "status": "disabled",
+    "url": "http://127.0.0.1:6006",
+    "logdir": "artifacts/runs/ablation_binary_contrastive/train",
+    "host": "0.0.0.0",
+    "port": 6006,
+    "pid": null
+  },
+  "wandb_service": {
+    "status": "disabled",
+    "project": "CLIPer",
+    "entity": "3151599052-nankai-university",
+    "run_id": null,
+    "run_name": null,
+    "mode": "online",
+    "url": null,
+    "dir": null
+  },
+  "fasta_path": "/data/huggs/hujh/CLIPer/dataset/t2_seqneg/test_caid3.fasta",
+  "split_manifest_path": null,
+  "split_key": null,
+  "threshold": 0.9500000000000003,
+  "batch_size": 2,
+  "motif": {
+    "enabled": false,
+    "source": null,
+    "matching": "prosite",
+    "tokenization": "special_token"
+  },
+  "dual_tokenizer": {
+    "enabled": false,
+    "fusion": "weighted_logits",
+    "branches": {
+      "plain": {
+        "weight": 0.5,
+        "tokenizer_name": null,
+        "motif": {
+          "enabled": false,
+          "source": null,
+          "matching": "prosite",
+          "tokenization": "special_token"
+        }
+      },
+      "special": {
+        "weight": 0.5,
+        "tokenizer_name": null,
+        "motif": {
+          "enabled": false,
+          "source": null,
+          "matching": "prosite",
+          "tokenization": "special_token"
+        }
+      }
+    }
+  }
+}

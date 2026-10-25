@@ -1,0 +1,10 @@
+{
+  "checkpoint": "artifacts/runs/ablation_ternary_contrastive/train/exp0001/checkpoints/best.pt",
+  "scene1_auroc": 0.913442451822961,
+  "scene1_residues": 20498,
+  "scene2_auroc": 0.7720232125037574,
+  "scene2_residues": 5362,
+  "scene3_auroc": 0.7513007284079084,
+  "scene3_window": 18,
+  "scene3_proteins": 62
+}

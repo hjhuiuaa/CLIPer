@@ -1,0 +1,74 @@
+{
+  "threshold": 0.9500000000000003,
+  "linker_class": 2,
+  "protocol": {
+    "t1": "linker vs {other_idr, ordered}",
+    "t2": "linker vs other_idr"
+  },
+  "train": {
+    "num_records": 448,
+    "num_scored_residues": 284617,
+    "auprc": 0.36885494477174213,
+    "auroc": 0.9443207243875031,
+    "auprc_t1": 0.36885494477174213,
+    "auroc_t1": 0.9443207243875031,
+    "f1": 0.4056004618937644,
+    "mcc": 0.38379228827399164,
+    "threshold": 0.9500000000000003,
+    "protocol_t1": "linker vs {other_idr, ordered}",
+    "linker_class": 2,
+    "auprc_t2": 0.6805508611697684,
+    "auroc_t2": 0.8940532659425914,
+    "num_scored_residues_t2": 43588,
+    "protocol_t2": "linker vs other_idr"
+  },
+  "val": {
+    "num_records": 112,
+    "num_scored_residues": 75695,
+    "auprc": 0.29171318989836803,
+    "auroc": 0.9051952204446291,
+    "auprc_t1": 0.29171318989836803,
+    "auroc_t1": 0.9051952204446291,
+    "f1": 0.3451446083125838,
+    "mcc": 0.3217698249330322,
+    "threshold": 0.9500000000000003,
+    "protocol_t1": "linker vs {other_idr, ordered}",
+    "linker_class": 2,
+    "auprc_t2": 0.5781777827217464,
+    "auroc_t2": 0.8070286054644177,
+    "num_scored_residues_t2": 11147,
+    "protocol_t2": "linker vs other_idr"
+  },
+  "test": {
+    "num_records": 31,
+    "num_scored_residues": 20498,
+    "auprc": 0.5250819036570953,
+    "auroc": 0.9144707619363946,
+    "auprc_t1": 0.5250819036570953,
+    "auroc_t1": 0.9144707619363946,
+    "f1": 0.45814581458145814,
+    "mcc": 0.44356865337213136,
+    "threshold": 0.9500000000000003,
+    "protocol_t1": "linker vs {other_idr, ordered}",
+    "linker_class": 2,
+    "auprc_t2": 0.8547422735379898,
+    "auroc_t2": 0.8130385349677729,
+    "num_scored_residues_t2": 2381,
+    "protocol_t2": "linker vs other_idr"
+  },
+  "auroc": {
+    "train": 0.9443207243875031,
+    "val": 0.9051952204446291,
+    "test": 0.9144707619363946
+  },
+  "auroc_t1": {
+    "train": 0.9443207243875031,
+    "val": 0.9051952204446291,
+    "test": 0.9144707619363946
+  },
+  "auroc_t2": {
+    "train": 0.8940532659425914,
+    "val": 0.8070286054644177,
+    "test": 0.8130385349677729
+  }
+}

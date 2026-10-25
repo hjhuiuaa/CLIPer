@@ -1,0 +1,6 @@
+[2026-10-24 11:39:06] [tensorboard] auto start disabled by config.
+[2026-10-24 11:39:06] [wandb] temporarily commented out (disabled).
+[2026-10-24 11:39:09] [eval] checkpoint=best.pt output_dir=artifacts/runs/ablation_binary_contrastive/three_scenes/scene1 auprc=0.523133 auroc=0.912349 f1=0.470013 mcc=0.453870
+[2026-10-24 11:39:09] [tensorboard] auto start disabled by config.
+[2026-10-24 11:39:09] [wandb] temporarily commented out (disabled).
+[2026-10-24 11:39:13] [eval] checkpoint=best.pt output_dir=artifacts/runs/ablation_binary_contrastive/three_scenes/scene2 auprc=0.387877 auroc=0.903180 f1=0.390550 mcc=0.366701

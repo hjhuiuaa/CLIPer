@@ -1,0 +1,91 @@
+{
+  "dataset": {
+    "output_dir": "/data/huggs/hujh/CLIPer/dataset/t2_seqneg",
+    "split": {
+      "source_records": 298,
+      "eligible_records": 280,
+      "train_records": 448,
+      "val_records": 112,
+      "excluded_error_records": 18,
+      "excluded_holdout_overlap_records": 0,
+      "linker_train_records": 224,
+      "linker_val_records": 56,
+      "extra_train_records": 224,
+      "extra_val_records": 56
+    },
+    "sampling": {
+      "mode": "sequence_level",
+      "n_linker_eligible": 280,
+      "n_extra_sampled": 280,
+      "train_label_counts": {
+        "0": 241029,
+        "1": 33776,
+        "2": 9812,
+        "-": 0
+      },
+      "val_label_counts": {
+        "0": 64548,
+        "1": 8560,
+        "2": 2587,
+        "-": 0
+      },
+      "test_label_counts": {
+        "0": 18117,
+        "1": 1002,
+        "2": 1379,
+        "-": 0
+      },
+      "train_linker_label_counts": {
+        "0": 131691,
+        "1": 9502,
+        "2": 9812,
+        "-": 0
+      },
+      "train_extra_label_counts": {
+        "0": 109338,
+        "1": 24274,
+        "2": 0,
+        "-": 0
+      }
+    },
+    "encoding": {
+      "0": "ordered (non-disorder); disorder '-' mapped to 0",
+      "1": "other IDR (disorder, not linker)",
+      "2": "linker",
+      "-": "unused (no residue undersample)"
+    },
+    "selection_reason": "Sequence-level 1:1 negatives (no residue undersampling).\n\n1. Keep every DisProt protein that has at least one linker residue (after\n   dropping CAID3 holdout and error.txt). All residues on those chains stay\n   labeled 0/1/2/-; nothing is dropped to '-' by sampling.\n\n2. Linker.fasta and disorder.fasta are the same 2896 DisProt IDs. Extra\n   negatives are proteins with zero linker residues. Sample N_extra = N_linker\n   sequences, preferring chains that contain both ordered (0) and other-IDR (1).\n\n3. Split linker proteins 80/20 (seed 42) and extra proteins 80/20 independently\n   so train/val each stay sequence-balanced.\n\n4. Labels:\n     0 = ordered (non-disorder); disorder-track '-' is also 0\n     1 = other IDR (disorder, not linker)\n     2 = linker\n     - = unused here (no residue undersample)\n\n5. CAID3 test is still the 31 linker sequences, labeled from linker + disorder-PDB\n   (disorder '-' counted as ordered 0)."
+  },
+  "extract": {
+    "embeddings_dir": "/data/huggs/hujh/CLIPer/artifacts/runs/ablation_ternary_contrastive/embeddings",
+    "timings_csv": "/data/huggs/hujh/CLIPer/artifacts/runs/ablation_ternary_contrastive/timings.csv",
+    "proteins_in_fasta": 591,
+    "files_written": 591,
+    "files_skipped": 0
+  },
+  "train": {
+    "run_id": "exp0001",
+    "output_dir": "artifacts/runs/ablation_ternary_contrastive/train/exp0001",
+    "best_checkpoint": "artifacts/runs/ablation_ternary_contrastive/train/exp0001/checkpoints/best.pt",
+    "split_auroc_json": "artifacts/runs/ablation_ternary_contrastive/train/exp0001/metrics/split_auroc.json"
+  },
+  "protocol": {
+    "t1": "linker vs {other_idr, ordered}",
+    "t2": "linker vs other_idr"
+  },
+  "auroc_t1": {
+    "train": 0.9451088958435954,
+    "val": 0.9078844444443505,
+    "test": 0.913442451822961
+  },
+  "auroc_t2": {
+    "train": 0.8979433901521992,
+    "val": 0.81578981355375,
+    "test": 0.825373545874169
+  },
+  "auroc": {
+    "train": 0.9451088958435954,
+    "val": 0.9078844444443505,
+    "test": 0.913442451822961
+  }
+}

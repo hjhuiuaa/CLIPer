@@ -1,0 +1,19 @@
+{
+  "metrics": {
+    "num_records": 112,
+    "num_scored_residues": 75695,
+    "auprc": 0.3018262730421831,
+    "auroc": 0.9064779650754816,
+    "auprc_t1": 0.3018262730421831,
+    "auroc_t1": 0.9064779650754816,
+    "f1": 0.3685323558437896,
+    "mcc": 0.35433482214543793,
+    "threshold": 0.9000000000000002,
+    "protocol_t1": "linker vs {other_idr, ordered}",
+    "linker_class": 2,
+    "auprc_t2": 0.6333915819712876,
+    "auroc_t2": 0.8426775773186566,
+    "num_scored_residues_t2": 11147,
+    "protocol_t2": "linker vs other_idr"
+  }
+}
