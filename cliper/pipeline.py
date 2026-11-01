@@ -266,12 +266,21 @@ def _resolve_contrastive_config(config: dict[str, Any], stage: str) -> dict[str,
             f"got {defaults['max_samples_per_class']}"
         )
     mode = str(defaults.get("mode", "hierarchical")).lower()
-    if mode not in {"hierarchical", "binary", "ternary", "none"}:
+    if mode not in {"hierarchical", "binary", "ternary", "tcl", "none"}:
         raise ValueError(
-            "contrastive.mode must be one of ['hierarchical', 'binary', 'ternary', 'none'], "
+            "contrastive.mode must be one of ['hierarchical', 'binary', 'ternary', 'tcl', 'none'], "
             f"got {mode!r}"
         )
     defaults["mode"] = mode
+    if mode == "tcl":
+        margin = float(defaults.get("margin", 1.0))
+        if margin <= 0:
+            raise ValueError(f"contrastive.margin must be > 0, got {margin}")
+        defaults["margin"] = margin
+        center_lr = float(defaults.get("center_lr", 0.01))
+        if center_lr <= 0:
+            raise ValueError(f"contrastive.center_lr must be > 0, got {center_lr}")
+        defaults["center_lr"] = center_lr
     if mode == "none":
         defaults["enabled"] = False
     return defaults
@@ -612,7 +621,7 @@ def load_config(path: str | Path) -> dict[str, Any]:
         stage == "stage7" and int(merged["classifier_head"].get("num_classes", 1)) > 1
     )
     # binary/ternary are explicit ablation modes and stay on for a single linker head.
-    contrastive_ablation = str(merged["contrastive"].get("mode", "hierarchical")) in {"binary", "ternary"}
+    contrastive_ablation = str(merged["contrastive"].get("mode", "hierarchical")) in {"binary", "ternary", "tcl"}
     if (
         stage in {"stage3", "stage4", "stage5", "stage6", "stage7"}
         and bool(merged["contrastive"].get("enabled", False))
@@ -721,7 +730,21 @@ def _load_model_state(
     *,
     logger=None,
 ) -> None:
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    current = model.state_dict()
+    filtered: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        current_value = current.get(key)
+        if key == "class_centers" and key not in current:
+            continue
+        if (
+            key.startswith("projection_head.")
+            and isinstance(value, torch.Tensor)
+            and isinstance(current_value, torch.Tensor)
+            and tuple(value.shape) != tuple(current_value.shape)
+        ):
+            continue
+        filtered[key] = value
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
     allowed_missing_prefixes = ("projection_head.",)
     disallowed_missing = [name for name in missing if not name.startswith(allowed_missing_prefixes)]
     if disallowed_missing or unexpected:
@@ -1097,7 +1120,7 @@ def _contrastive_label_tensor(
     The classification target may already be binarized when num_classes == 1.
     Contrastive learning still needs the original ordered / other-IDR / linker codes.
     """
-    if not enabled or mode not in {"binary", "ternary"}:
+    if not enabled or mode not in {"binary", "ternary", "tcl"}:
         return None
     return _labels_to_tensor(
         label_strings,
@@ -1505,6 +1528,43 @@ def _supervised_contrastive_loss(
     return loss
 
 
+def _triplet_center_loss(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    centers: torch.Tensor,
+    *,
+    margin: float,
+) -> tuple[torch.Tensor, int]:
+    """Multi-class triplet center loss.
+
+    Each residue is pulled toward its class center and pushed from the nearest
+    other center by ``margin``. This is the He et al. (CVPR 2018) form used by
+    CLAPE-SMB for two classes, extended to classes 0, 1 and 2.
+    """
+    if embeddings.dim() == 3:
+        flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+        flat_labels = labels.reshape(-1)
+    elif embeddings.dim() == 2:
+        flat_embeddings = embeddings
+        flat_labels = labels.reshape(-1)
+    else:
+        raise ValueError(f"Expected embeddings [N, D] or [B, L, D], got {tuple(embeddings.shape)}")
+    valid = (flat_labels >= 0) & (flat_labels < centers.shape[0])
+    count = int(valid.sum().item())
+    if count == 0:
+        return embeddings.new_zeros(()), 0
+    feats = flat_embeddings[valid]
+    class_ids = flat_labels[valid].to(dtype=torch.long)
+    distances = torch.cdist(feats, centers, p=2)
+    own = distances.gather(1, class_ids.unsqueeze(1)).squeeze(1)
+    others = distances.scatter(1, class_ids.unsqueeze(1), float("inf"))
+    nearest_other = others.min(dim=1).values
+    loss = torch.relu(own + float(margin) - nearest_other).mean()
+    if not torch.isfinite(loss):
+        raise ValueError("Triplet center loss became non-finite; please check margin and center_lr.")
+    return loss, count
+
+
 def _batched_forward(
     model: nn.Module,
     tokenizer: Any,
@@ -1820,9 +1880,11 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
     contrastive_mode = str(contrastive_cfg.get("mode", "hierarchical")).lower()
     contrastive_weight = float(contrastive_cfg.get("weight", 0.0)) if contrastive_enabled else 0.0
     contrastive_neg_weight = float(contrastive_cfg.get("neg_weight", 0.0)) if contrastive_enabled else 0.0
-    if contrastive_mode in {"binary", "ternary"}:
+    if contrastive_mode in {"binary", "ternary", "tcl"}:
         contrastive_neg_weight = 0.0
     contrastive_temperature = float(contrastive_cfg.get("temperature", 0.1))
+    contrastive_margin = float(contrastive_cfg.get("margin", 1.0))
+    contrastive_center_lr = float(contrastive_cfg.get("center_lr", 0.01))
     contrastive_max_samples = int(contrastive_cfg.get("max_samples_per_class", 256))
     linker_class = int(classifier_head_cfg.get("linker_class", 1))
     dual_binary = bool(classifier_head_cfg.get("dual_binary", False))
@@ -1880,6 +1942,11 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         f"contrastive_weight={contrastive_weight:.4f} "
         f"contrastive_neg_weight={contrastive_neg_weight:.4f} "
         f"linker_class={linker_class}"
+        + (
+            f" contrastive_margin={contrastive_margin:.4f} center_lr={contrastive_center_lr:.6f}"
+            if contrastive_mode == "tcl"
+            else ""
+        )
     )
     if bool(config.get("stage_contrastive_forced_off", False)):
         log(f"[{stage}] contrastive.enabled=true ignored; forced to false for {stage}.")
@@ -2144,6 +2211,11 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
             motif=motif_cfg if embedding_cache is None else {"enabled": False},
             motif_vocab_size=(len(motif_vocab) if motif_vocab is not None else 0),
         ).to(device)
+        if contrastive_enabled and contrastive_mode == "tcl":
+            centers = nn.Parameter(torch.empty(3, int(contrastive_cfg["proj_dim"]), device=device))
+            nn.init.normal_(centers, std=0.05)
+            model.register_parameter("class_centers", centers)
+            log("[tcl] registered 3 class centers for ordered / other-IDR / linker")
         if motif_tokenizer_info is not None:
             configure_trainable_token_embeddings(backbone, motif_tokenizer_info["token_ids"])
 
@@ -2255,7 +2327,24 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
         collate_fn=_collate,
     )
 
-    optimizer = AdamW(model.parameters(), lr=float(config["lr"]), weight_decay=float(config["weight_decay"]))
+    if contrastive_enabled and contrastive_mode == "tcl" and hasattr(model, "class_centers"):
+        other_params = [param for name, param in model.named_parameters() if name != "class_centers"]
+        optimizer = AdamW(
+            [
+                {
+                    "params": other_params,
+                    "lr": float(config["lr"]),
+                    "weight_decay": float(config["weight_decay"]),
+                },
+                {
+                    "params": [model.class_centers],
+                    "lr": contrastive_center_lr,
+                    "weight_decay": 0.0,
+                },
+            ]
+        )
+    else:
+        optimizer = AdamW(model.parameters(), lr=float(config["lr"]), weight_decay=float(config["weight_decay"]))
     scaler = _build_grad_scaler(enabled=use_amp)
     criterion_type: nn.Module | None = None
     if dual_binary:
@@ -2729,7 +2818,16 @@ def train(config_path: str | Path, resume_checkpoint: str | Path | None = None) 
                             contrastive_labels = batch.get("contrastive_labels", labels)
                             if contrastive_labels is not labels:
                                 contrastive_labels = contrastive_labels.to(device)
-                            if contrastive_mode == "ternary":
+                            if contrastive_mode == "tcl":
+                                if not hasattr(model, "class_centers"):
+                                    raise RuntimeError("tcl mode requires model.class_centers.")
+                                posneg_loss, contrastive_num_samples = _triplet_center_loss(
+                                    residue_embeddings,
+                                    contrastive_labels,
+                                    model.class_centers,
+                                    margin=contrastive_margin,
+                                )
+                            elif contrastive_mode == "ternary":
                                 posneg_loss, contrastive_num_samples = _compute_batch_supcon_loss(
                                     residue_embeddings,
                                     contrastive_labels,

@@ -512,16 +512,25 @@ class RNNClassifierHead(nn.Module):
             dropout=dropout,
         )
         out_dim = hidden_size * (2 if bidirectional else 1)
+        self.encoded_dim = out_dim
         self.norm = nn.LayerNorm(out_dim)
         self.output_dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(out_dim, 1)
 
-    def forward(self, x: torch.Tensor, *, residue_lengths: list[int]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residue_lengths: list[int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         projected = self.input_dropout(self.input_proj(x))
         encoded = _run_rnn_over_residues(self.rnn, projected, residue_lengths)
         encoded = self.output_dropout(self.norm(encoded))
-        logits = self.classifier(encoded)
-        return _mask_padded_logits(logits, residue_lengths)
+        logits = _mask_padded_logits(self.classifier(encoded), residue_lengths)
+        if return_hidden:
+            return logits, encoded
+        return logits
 
 
 class CRNNClassifierHead(nn.Module):
@@ -592,18 +601,27 @@ class CRNNClassifierHead(nn.Module):
             dropout=dropout,
         )
         out_dim = rnn_hidden_size * (2 if bidirectional else 1)
+        self.encoded_dim = out_dim
         self.norm = nn.LayerNorm(out_dim)
         self.output_dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(out_dim, num_classes)
 
-    def forward(self, x: torch.Tensor, *, residue_lengths: list[int]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residue_lengths: list[int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # [B, L, H] -> [B, H, L] for conv1d along residues, then back to [B, L, C].
         y = self.conv(x.transpose(1, 2)).transpose(1, 2)
         y = self.rnn_dropout(y)
         encoded = _run_rnn_over_residues(self.rnn, y, residue_lengths)
         encoded = self.output_dropout(self.norm(encoded))
-        logits = self.classifier(encoded)
-        return _mask_padded_logits(logits, residue_lengths)
+        logits = _mask_padded_logits(self.classifier(encoded), residue_lengths)
+        if return_hidden:
+            return logits, encoded
+        return logits
 
 
 class CNNClassifierHead(nn.Module):
@@ -780,8 +798,15 @@ class ResidueClassifier(nn.Module):
         proj_mid = hidden_size if proj_hidden is None else int(proj_hidden)
         if proj_mid <= 0:
             raise ValueError(f"proj_hidden must be > 0, got {proj_mid}")
+        # RNN/CRNN: project the state that the classification layer reads, so
+        # contrastive gradients update the conv/GRU. Other heads still project
+        # the frozen local features.
+        if head_type in {"rnn", "crnn"}:
+            proj_in = int(self.classifier.encoded_dim)
+        else:
+            proj_in = classifier_input_dim
         self.projection_head = nn.Sequential(
-            nn.Linear(classifier_input_dim, proj_mid),
+            nn.Linear(proj_in, proj_mid),
             nn.ReLU(),
             nn.Linear(proj_mid, projection_dim),
         )
@@ -839,11 +864,19 @@ class ResidueClassifier(nn.Module):
                 residue_hidden = hidden[:, :max_len, :]
         contextual_hidden = _concat_local_window(residue_hidden, residue_lengths, self.local_context)
         classifier_input = self.dropout(contextual_hidden)
+        contrastive_hidden = None
         if self.classifier_type == "transformer":
             padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
             raw_logits = self.classifier(classifier_input, padding_mask=padding_mask)
         elif self.classifier_type in {"rnn", "crnn"}:
-            raw_logits = self.classifier(classifier_input, residue_lengths=residue_lengths)
+            if return_embeddings:
+                raw_logits, contrastive_hidden = self.classifier(
+                    classifier_input,
+                    residue_lengths=residue_lengths,
+                    return_hidden=True,
+                )
+            else:
+                raw_logits = self.classifier(classifier_input, residue_lengths=residue_lengths)
         else:
             raw_logits = self.classifier(classifier_input)
         if raw_logits.shape[-1] == 1:
@@ -852,7 +885,10 @@ class ResidueClassifier(nn.Module):
             logits = raw_logits
         if not return_embeddings:
             return logits
-        embeddings = self.projection_head(classifier_input)
+        if contrastive_hidden is None:
+            embeddings = self.projection_head(classifier_input)
+        else:
+            embeddings = self.projection_head(contrastive_hidden)
         return logits, embeddings
 
 

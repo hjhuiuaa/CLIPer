@@ -1,0 +1,10 @@
+{
+  "checkpoint": "artifacts/runs/ablation_shared_20261031/binary/train/exp0001/checkpoints/best.pt",
+  "scene1_auroc": 0.9112276110757171,
+  "scene1_residues": 20498,
+  "scene2_auroc": 0.7711370132344553,
+  "scene2_residues": 5362,
+  "scene3_auroc": 0.7325702393340271,
+  "scene3_window": 18,
+  "scene3_proteins": 62
+}

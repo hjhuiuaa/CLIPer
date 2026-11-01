@@ -1,0 +1,6 @@
+[2026-10-31 23:49:38] [tensorboard] auto start disabled by config.
+[2026-10-31 23:49:38] [wandb] temporarily commented out (disabled).
+[2026-10-31 23:49:39] [eval] checkpoint=best.pt output_dir=artifacts/runs/ablation_shared_20261031/supcon/three_scenes/scene1 auprc=0.518809 auroc=0.911365 f1=0.513037 mcc=0.480978
+[2026-10-31 23:49:39] [tensorboard] auto start disabled by config.
+[2026-10-31 23:49:39] [wandb] temporarily commented out (disabled).
+[2026-10-31 23:49:40] [eval] checkpoint=best.pt output_dir=artifacts/runs/ablation_shared_20261031/supcon/three_scenes/scene2 auprc=0.375814 auroc=0.903212 f1=0.373430 mcc=0.352775

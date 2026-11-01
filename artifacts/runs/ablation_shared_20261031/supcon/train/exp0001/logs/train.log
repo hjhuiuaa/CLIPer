@@ -1,0 +1,150 @@
+[2026-10-31 23:43:56] Run started: run_id=exp0001 output_dir=artifacts/runs/ablation_shared_20261031/supcon/train/exp0001
+[2026-10-31 23:43:56] Run stage=stage7 contrastive_enabled=True contrastive_mode=ternary contrastive_weight=0.2000 contrastive_neg_weight=0.0000 linker_class=2
+[2026-10-31 23:43:56] [tensorboard] auto start disabled by config.
+[2026-10-31 23:43:56] [wandb] temporarily commented out (disabled).
+[2026-10-31 23:43:56] [embeddings] loaded 591 proteins from artifacts/runs/ablation_shared_20261031/supcon/embeddings
+[2026-10-31 23:43:56] [embeddings] training classifier on cached ProstT5 features hidden_size=1024
+[2026-10-31 23:43:59] [train] epoch=1 step=20 avg_total=2.670196 avg_bce=1.472460 avg_supcon=1.197736 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:00] [train] epoch=1 step=40 avg_total=2.621063 avg_bce=1.438685 avg_supcon=1.182378 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:02] [train] epoch=1 step=60 avg_total=2.214947 avg_bce=1.031008 avg_supcon=1.183939 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:04] [train] epoch=1 step=80 avg_total=1.985290 avg_bce=0.810733 avg_supcon=1.174558 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:06] [train] epoch=1 step=100 avg_total=2.288204 avg_bce=1.115623 avg_supcon=1.172581 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:08] [train] epoch=1 step=120 avg_total=2.459472 avg_bce=1.266618 avg_supcon=1.192854 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:10] [train] epoch=1 step=140 avg_total=2.030286 avg_bce=0.866139 avg_supcon=1.164147 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:11] [train] epoch=1 step=160 avg_total=2.172220 avg_bce=1.056377 avg_supcon=1.115843 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:13] [train] epoch=1 step=180 avg_total=2.172914 avg_bce=0.997301 avg_supcon=1.175612 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:15] [train] epoch=1 step=200 avg_total=2.141325 avg_bce=0.953390 avg_supcon=1.187935 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:30] [eval] reason=interval epoch=1 step=200 train_auprc=0.248666 train_auroc=0.878253 val_auprc=0.225629 val_auroc=0.868227 f1=0.280781 mcc=0.282714 threshold=0.8000 train_auroc_t1=0.878253 train_auroc_t2=0.800163 val_auroc_t1=0.868227 val_auprc_t2=0.500670 val_auroc_t2=0.759755
+[2026-10-31 23:44:30] [best] updated best checkpoint at epoch=1, step=200, val_auroc_t1=0.868227
+[2026-10-31 23:44:32] [train] epoch=1 step=220 avg_total=1.958909 avg_bce=0.766627 avg_supcon=1.192282 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:33] [train] epoch=1 step=224 avg_total=2.883399 avg_bce=1.687930 avg_supcon=1.195469 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:33] [epoch] epoch=1 steps=224 global_step=224 train_total=2.258170 train_bce=1.081477 train_supcon=1.176693 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=36.229
+[2026-10-31 23:44:34] [train] epoch=2 step=240 avg_total=1.992460 avg_bce=0.822497 avg_supcon=1.169963 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:36] [train] epoch=2 step=260 avg_total=2.078407 avg_bce=0.892607 avg_supcon=1.185800 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:38] [train] epoch=2 step=280 avg_total=1.898160 avg_bce=0.720399 avg_supcon=1.177762 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:40] [train] epoch=2 step=300 avg_total=1.974772 avg_bce=0.800790 avg_supcon=1.173982 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:41] [train] epoch=2 step=320 avg_total=2.276792 avg_bce=1.081778 avg_supcon=1.195014 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:43] [train] epoch=2 step=340 avg_total=2.799742 avg_bce=1.599068 avg_supcon=1.200674 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:45] [train] epoch=2 step=360 avg_total=2.302914 avg_bce=1.131208 avg_supcon=1.171706 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:47] [train] epoch=2 step=380 avg_total=2.168050 avg_bce=0.991880 avg_supcon=1.176170 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:44:49] [train] epoch=2 step=400 avg_total=2.111688 avg_bce=0.929735 avg_supcon=1.181953 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:02] [eval] reason=interval epoch=2 step=400 train_auprc=0.271970 train_auroc=0.896285 val_auprc=0.250077 val_auroc=0.883184 f1=0.303425 mcc=0.291544 threshold=0.8500 train_auroc_t1=0.896285 train_auroc_t2=0.804857 val_auroc_t1=0.883184 val_auprc_t2=0.499450 val_auroc_t2=0.739532
+[2026-10-31 23:45:02] [best] updated best checkpoint at epoch=2, step=400, val_auroc_t1=0.883184
+[2026-10-31 23:45:04] [train] epoch=2 step=420 avg_total=2.050556 avg_bce=0.884472 avg_supcon=1.166084 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:06] [train] epoch=2 step=440 avg_total=1.917504 avg_bce=0.750084 avg_supcon=1.167420 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:07] [train] epoch=2 step=448 avg_total=1.770730 avg_bce=0.604729 avg_supcon=1.166001 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:07] [epoch] epoch=2 steps=224 global_step=448 train_total=2.132218 train_bce=0.953742 train_supcon=1.178476 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=34.179
+[2026-10-31 23:45:08] [train] epoch=3 step=460 avg_total=2.365341 avg_bce=1.162000 avg_supcon=1.203341 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:10] [train] epoch=3 step=480 avg_total=2.175464 avg_bce=1.005086 avg_supcon=1.170378 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:11] [train] epoch=3 step=500 avg_total=1.844362 avg_bce=0.670800 avg_supcon=1.173562 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:12] [save] periodic checkpoint saved: step_0000500.pt
+[2026-10-31 23:45:13] [train] epoch=3 step=520 avg_total=1.996823 avg_bce=0.843109 avg_supcon=1.153713 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:15] [train] epoch=3 step=540 avg_total=2.307774 avg_bce=1.116620 avg_supcon=1.191155 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:17] [train] epoch=3 step=560 avg_total=1.971246 avg_bce=0.800164 avg_supcon=1.171082 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:18] [train] epoch=3 step=580 avg_total=2.062903 avg_bce=0.892068 avg_supcon=1.170836 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:20] [train] epoch=3 step=600 avg_total=2.249528 avg_bce=1.072300 avg_supcon=1.177228 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:33] [eval] reason=interval epoch=3 step=600 train_auprc=0.306662 train_auroc=0.909548 val_auprc=0.265144 val_auroc=0.889771 f1=0.300394 mcc=0.285750 threshold=0.9000 train_auroc_t1=0.909548 train_auroc_t2=0.837077 val_auroc_t1=0.889771 val_auprc_t2=0.529441 val_auroc_t2=0.774532
+[2026-10-31 23:45:33] [best] updated best checkpoint at epoch=3, step=600, val_auroc_t1=0.889771
+[2026-10-31 23:45:35] [train] epoch=3 step=620 avg_total=1.895500 avg_bce=0.708978 avg_supcon=1.186521 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:37] [train] epoch=3 step=640 avg_total=2.204029 avg_bce=1.012285 avg_supcon=1.191744 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:39] [train] epoch=3 step=660 avg_total=1.960538 avg_bce=0.790830 avg_supcon=1.169708 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:40] [train] epoch=3 step=672 avg_total=1.984553 avg_bce=0.826478 avg_supcon=1.158075 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:40] [epoch] epoch=3 steps=224 global_step=672 train_total=2.078402 train_bce=0.902261 train_supcon=1.176141 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=33.128
+[2026-10-31 23:45:41] [train] epoch=4 step=680 avg_total=2.441705 avg_bce=1.276433 avg_supcon=1.165272 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:42] [train] epoch=4 step=700 avg_total=1.940761 avg_bce=0.773794 avg_supcon=1.166967 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:44] [train] epoch=4 step=720 avg_total=1.864636 avg_bce=0.696285 avg_supcon=1.168351 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:46] [train] epoch=4 step=740 avg_total=1.739421 avg_bce=0.556442 avg_supcon=1.182980 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:48] [train] epoch=4 step=760 avg_total=2.125429 avg_bce=0.933121 avg_supcon=1.192308 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:50] [train] epoch=4 step=780 avg_total=1.978730 avg_bce=0.801499 avg_supcon=1.177231 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:45:52] [train] epoch=4 step=800 avg_total=2.071695 avg_bce=0.897871 avg_supcon=1.173823 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:05] [eval] reason=interval epoch=4 step=800 train_auprc=0.320899 train_auroc=0.918344 val_auprc=0.256859 val_auroc=0.890047 f1=0.323755 mcc=0.299446 threshold=0.9500 train_auroc_t1=0.918344 train_auroc_t2=0.834837 val_auroc_t1=0.890047 val_auprc_t2=0.493027 val_auroc_t2=0.749995
+[2026-10-31 23:46:05] [early-stop] no improvement count=1/3 (need +0.0020 on val_auroc_t1)
+[2026-10-31 23:46:07] [train] epoch=4 step=820 avg_total=2.019166 avg_bce=0.825546 avg_supcon=1.193620 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:09] [train] epoch=4 step=840 avg_total=2.246112 avg_bce=1.061738 avg_supcon=1.184374 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:11] [train] epoch=4 step=860 avg_total=1.941054 avg_bce=0.794111 avg_supcon=1.146943 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:13] [train] epoch=4 step=880 avg_total=1.998579 avg_bce=0.814741 avg_supcon=1.183838 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:14] [train] epoch=4 step=896 avg_total=1.891557 avg_bce=0.730891 avg_supcon=1.160666 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:14] [epoch] epoch=4 steps=224 global_step=896 train_total=2.001385 train_bce=0.825932 train_supcon=1.175453 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=34.026
+[2026-10-31 23:46:14] [train] epoch=5 step=900 avg_total=1.607853 avg_bce=0.429808 avg_supcon=1.178045 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:16] [train] epoch=5 step=920 avg_total=1.887952 avg_bce=0.704805 avg_supcon=1.183147 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:18] [train] epoch=5 step=940 avg_total=1.706273 avg_bce=0.538861 avg_supcon=1.167412 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:20] [train] epoch=5 step=960 avg_total=1.952975 avg_bce=0.783196 avg_supcon=1.169779 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:21] [train] epoch=5 step=980 avg_total=2.159754 avg_bce=0.982448 avg_supcon=1.177306 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:23] [train] epoch=5 step=1000 avg_total=1.897147 avg_bce=0.722600 avg_supcon=1.174546 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:23] [save] periodic checkpoint saved: step_0001000.pt
+[2026-10-31 23:46:36] [eval] reason=interval epoch=5 step=1000 train_auprc=0.337504 train_auroc=0.928840 val_auprc=0.293743 val_auroc=0.903958 f1=0.348984 mcc=0.352949 threshold=0.8500 train_auroc_t1=0.928840 train_auroc_t2=0.867049 val_auroc_t1=0.903958 val_auprc_t2=0.573222 val_auroc_t2=0.796192
+[2026-10-31 23:46:36] [best] updated best checkpoint at epoch=5, step=1000, val_auroc_t1=0.903958
+[2026-10-31 23:46:38] [train] epoch=5 step=1020 avg_total=1.745763 avg_bce=0.584621 avg_supcon=1.161142 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:40] [train] epoch=5 step=1040 avg_total=2.310528 avg_bce=1.135427 avg_supcon=1.175101 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:41] [train] epoch=5 step=1060 avg_total=1.743225 avg_bce=0.587859 avg_supcon=1.155366 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:43] [train] epoch=5 step=1080 avg_total=2.298862 avg_bce=1.113104 avg_supcon=1.185758 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:45] [train] epoch=5 step=1100 avg_total=1.859582 avg_bce=0.675263 avg_supcon=1.184318 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:47] [train] epoch=5 step=1120 avg_total=1.892645 avg_bce=0.716507 avg_supcon=1.176138 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:47] [epoch] epoch=5 steps=224 global_step=1120 train_total=1.944310 train_bce=0.770594 train_supcon=1.173716 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=32.870
+[2026-10-31 23:46:49] [train] epoch=6 step=1140 avg_total=1.649423 avg_bce=0.480014 avg_supcon=1.169409 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:51] [train] epoch=6 step=1160 avg_total=1.798576 avg_bce=0.621734 avg_supcon=1.176842 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:53] [train] epoch=6 step=1180 avg_total=1.764108 avg_bce=0.583671 avg_supcon=1.180437 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:46:54] [train] epoch=6 step=1200 avg_total=1.834253 avg_bce=0.660729 avg_supcon=1.173524 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:09] [eval] reason=interval epoch=6 step=1200 train_auprc=0.350665 train_auroc=0.931041 val_auprc=0.260637 val_auroc=0.895049 f1=0.318116 mcc=0.298185 threshold=0.9500 train_auroc_t1=0.931041 train_auroc_t2=0.870198 val_auroc_t1=0.895049 val_auprc_t2=0.520290 val_auroc_t2=0.783727
+[2026-10-31 23:47:09] [early-stop] no improvement count=1/3 (need +0.0020 on val_auroc_t1)
+[2026-10-31 23:47:10] [train] epoch=6 step=1220 avg_total=2.251914 avg_bce=1.069419 avg_supcon=1.182496 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:12] [train] epoch=6 step=1240 avg_total=1.962776 avg_bce=0.805096 avg_supcon=1.157680 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:14] [train] epoch=6 step=1260 avg_total=2.178721 avg_bce=1.010476 avg_supcon=1.168245 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:16] [train] epoch=6 step=1280 avg_total=2.005431 avg_bce=0.824210 avg_supcon=1.181221 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:18] [train] epoch=6 step=1300 avg_total=2.014334 avg_bce=0.853348 avg_supcon=1.160987 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:19] [train] epoch=6 step=1320 avg_total=1.863210 avg_bce=0.688292 avg_supcon=1.174918 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:21] [train] epoch=6 step=1340 avg_total=2.013719 avg_bce=0.823835 avg_supcon=1.189884 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:22] [train] epoch=6 step=1344 avg_total=1.875148 avg_bce=0.720150 avg_supcon=1.154998 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:22] [epoch] epoch=6 steps=224 global_step=1344 train_total=1.938526 train_bce=0.764719 train_supcon=1.173807 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=34.823
+[2026-10-31 23:47:23] [train] epoch=7 step=1360 avg_total=1.835986 avg_bce=0.672886 avg_supcon=1.163101 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:25] [train] epoch=7 step=1380 avg_total=1.646544 avg_bce=0.467699 avg_supcon=1.178845 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:27] [train] epoch=7 step=1400 avg_total=1.790857 avg_bce=0.633433 avg_supcon=1.157423 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:40] [eval] reason=interval epoch=7 step=1400 train_auprc=0.367435 train_auroc=0.942587 val_auprc=0.294451 val_auroc=0.906537 f1=0.338285 mcc=0.323418 threshold=0.9000 train_auroc_t1=0.942587 train_auroc_t2=0.892996 val_auroc_t1=0.906537 val_auprc_t2=0.553134 val_auroc_t2=0.801057
+[2026-10-31 23:47:41] [best] updated best checkpoint at epoch=7, step=1400, val_auroc_t1=0.906537
+[2026-10-31 23:47:43] [train] epoch=7 step=1420 avg_total=1.758139 avg_bce=0.595450 avg_supcon=1.162689 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:44] [train] epoch=7 step=1440 avg_total=1.700421 avg_bce=0.541148 avg_supcon=1.159273 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:46] [train] epoch=7 step=1460 avg_total=2.138671 avg_bce=0.959903 avg_supcon=1.178768 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:48] [train] epoch=7 step=1480 avg_total=2.127133 avg_bce=0.956310 avg_supcon=1.170823 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:50] [train] epoch=7 step=1500 avg_total=1.934105 avg_bce=0.757965 avg_supcon=1.176140 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:50] [save] periodic checkpoint saved: step_0001500.pt
+[2026-10-31 23:47:52] [train] epoch=7 step=1520 avg_total=2.010157 avg_bce=0.829405 avg_supcon=1.180752 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:54] [train] epoch=7 step=1540 avg_total=1.854628 avg_bce=0.690942 avg_supcon=1.163686 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:55] [train] epoch=7 step=1560 avg_total=1.784711 avg_bce=0.622212 avg_supcon=1.162499 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:56] [train] epoch=7 step=1568 avg_total=1.892701 avg_bce=0.696323 avg_supcon=1.196378 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:56] [epoch] epoch=7 steps=224 global_step=1568 train_total=1.872432 train_bce=0.702795 train_supcon=1.169637 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=34.492
+[2026-10-31 23:47:57] [train] epoch=8 step=1580 avg_total=1.772477 avg_bce=0.598651 avg_supcon=1.173826 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:47:59] [train] epoch=8 step=1600 avg_total=1.838786 avg_bce=0.675516 avg_supcon=1.163270 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:12] [eval] reason=interval epoch=8 step=1600 train_auprc=0.391140 train_auroc=0.943810 val_auprc=0.310106 val_auroc=0.907413 f1=0.362236 mcc=0.340267 threshold=0.9500 train_auroc_t1=0.943810 train_auroc_t2=0.898718 val_auroc_t1=0.907413 val_auprc_t2=0.578155 val_auroc_t2=0.814250
+[2026-10-31 23:48:12] [early-stop] no improvement count=1/3 (need +0.0020 on val_auroc_t1)
+[2026-10-31 23:48:14] [train] epoch=8 step=1620 avg_total=1.768857 avg_bce=0.592942 avg_supcon=1.175915 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:16] [train] epoch=8 step=1640 avg_total=2.145587 avg_bce=0.975748 avg_supcon=1.169839 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:18] [train] epoch=8 step=1660 avg_total=1.820519 avg_bce=0.626497 avg_supcon=1.194022 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:20] [train] epoch=8 step=1680 avg_total=2.085654 avg_bce=0.893440 avg_supcon=1.192214 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:22] [train] epoch=8 step=1700 avg_total=1.817084 avg_bce=0.643571 avg_supcon=1.173514 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:23] [train] epoch=8 step=1720 avg_total=1.712035 avg_bce=0.556581 avg_supcon=1.155454 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:25] [train] epoch=8 step=1740 avg_total=1.773412 avg_bce=0.621997 avg_supcon=1.151415 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:27] [train] epoch=8 step=1760 avg_total=1.840064 avg_bce=0.664728 avg_supcon=1.175336 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:29] [train] epoch=8 step=1780 avg_total=1.653534 avg_bce=0.482345 avg_supcon=1.171189 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:29] [train] epoch=8 step=1792 avg_total=1.719022 avg_bce=0.557117 avg_supcon=1.161904 (epoch_end_flush) avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:29] [epoch] epoch=8 steps=224 global_step=1792 train_total=1.834860 train_bce=0.663109 train_supcon=1.171751 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=33.365
+[2026-10-31 23:48:30] [train] epoch=9 step=1800 avg_total=1.663406 avg_bce=0.491223 avg_supcon=1.172182 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:44] [eval] reason=interval epoch=9 step=1800 train_auprc=0.426932 train_auroc=0.950706 val_auprc=0.313632 val_auroc=0.900007 f1=0.360212 mcc=0.340050 threshold=0.9000 train_auroc_t1=0.950706 train_auroc_t2=0.911516 val_auroc_t1=0.900007 val_auprc_t2=0.583605 val_auroc_t2=0.810617
+[2026-10-31 23:48:44] [early-stop] no improvement count=2/3 (need +0.0020 on val_auroc_t1)
+[2026-10-31 23:48:46] [train] epoch=9 step=1820 avg_total=1.620761 avg_bce=0.462479 avg_supcon=1.158283 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:48] [train] epoch=9 step=1840 avg_total=1.805969 avg_bce=0.652037 avg_supcon=1.153932 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:49] [train] epoch=9 step=1860 avg_total=1.825367 avg_bce=0.637648 avg_supcon=1.187719 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:51] [train] epoch=9 step=1880 avg_total=2.031052 avg_bce=0.852159 avg_supcon=1.178893 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:53] [train] epoch=9 step=1900 avg_total=1.787718 avg_bce=0.637586 avg_supcon=1.150132 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:55] [train] epoch=9 step=1920 avg_total=1.649722 avg_bce=0.487302 avg_supcon=1.162420 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:57] [train] epoch=9 step=1940 avg_total=1.676450 avg_bce=0.516231 avg_supcon=1.160219 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:48:58] [train] epoch=9 step=1960 avg_total=1.675175 avg_bce=0.490817 avg_supcon=1.184358 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:49:01] [train] epoch=9 step=1980 avg_total=1.973394 avg_bce=0.796720 avg_supcon=1.176674 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:49:02] [train] epoch=9 step=2000 avg_total=1.676827 avg_bce=0.490103 avg_supcon=1.186724 avg_plain_bce=0.000000 avg_special_bce=0.000000
+[2026-10-31 23:49:02] [save] periodic checkpoint saved: step_0002000.pt
+[2026-10-31 23:49:15] [eval] reason=interval epoch=9 step=2000 train_auprc=0.408081 train_auroc=0.952254 val_auprc=0.300021 val_auroc=0.906627 f1=0.345676 mcc=0.342805 threshold=0.8500 train_auroc_t1=0.952254 train_auroc_t2=0.923089 val_auroc_t1=0.906627 val_auprc_t2=0.594066 val_auroc_t2=0.826614
+[2026-10-31 23:49:15] [early-stop] no improvement count=3/3 (need +0.0020 on val_auroc_t1)
+[2026-10-31 23:49:15] [early-stop] triggered at epoch=9, step=2000, patience=3
+[2026-10-31 23:49:15] [epoch] epoch=9 steps=208 global_step=2000 train_total=1.768057 train_bce=0.598036 train_supcon=1.170022 train_plain_bce=0.000000 train_special_bce=0.000000 epoch_seconds=45.494
+[2026-10-31 23:49:15] [save] last checkpoint saved: last.pt
+[2026-10-31 23:49:16] [caid3] t1_auprc=0.518809 t1_auroc=0.911365 t2_auprc=0.869379 t2_auroc=0.840366 f1=0.513037 mcc=0.480978 threshold=0.9000
+[2026-10-31 23:49:28] [split-auroc] train_t1=0.942587 train_t2=0.892996 val_t1=0.906537 val_t2=0.801057 test_t1=0.911365 test_t2=0.840366
