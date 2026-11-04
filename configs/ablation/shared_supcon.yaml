@@ -1,7 +1,7 @@
 # Small CRNN. SupCon reads the GRU state, so contrastive gradients update conv and GRU.
 # No class centers. Prediction remains sigmoid of the linker logit.
 stage: stage7
-backbone_name: /data/huggs/hujh/CLIPer/models/Rostlab-ProstT5
+backbone_name: Rostlab/ProstT5
 window_size: 1024
 batch_tokens: 2048
 optimizer: adamw
@@ -65,7 +65,7 @@ auto_start_tensorboard: false
 tensorboard_host: 0.0.0.0
 tensorboard_port: 6006
 use_wandb: false
-wandb_entity: 3151599052-nankai-university
+wandb_entity: ""
 wandb_project: CLIPer
 wandb_mode: online
 wandb_run_name: shared_supcon

@@ -105,6 +105,7 @@ def runall_caid(
             emb_path = _embedding_output_path(emb_dir, protein_id, "npy")
             _write_embedding(emb_path, embeddings, "npy")
 
+        head_cfg = dict(config.get("classifier_head", {}))
         probabilities = predict_sequence_from_embedding(
             classifier,
             sequence=seq,
@@ -115,6 +116,8 @@ def runall_caid(
             top_k_heuristic=resolved_top_k,
             device=torch_device,
             window_batch_size=window_batch_size,
+            linker_class=int(head_cfg.get("linker_class", 1)),
+            dual_binary=bool(head_cfg.get("dual_binary", False)),
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         timings_ms.append((protein_id, elapsed_ms))
