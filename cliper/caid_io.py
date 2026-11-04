@@ -80,6 +80,11 @@ def _candidate_embedding_paths(embeddings_dir: Path, protein_id: str) -> list[Pa
             if candidate not in seen:
                 seen.add(candidate)
                 paths.append(candidate)
+        # Legacy: extract_embeddings once wrote {id}.resfeat.npy before naming fix.
+        legacy_npy = embeddings_dir / f"{stem}.resfeat.npy"
+        if legacy_npy not in seen:
+            seen.add(legacy_npy)
+            paths.append(legacy_npy)
     return paths
 
 

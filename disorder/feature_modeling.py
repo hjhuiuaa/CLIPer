@@ -114,6 +114,7 @@ class DisorderFeatureClassifier(nn.Module):
                 bidirectional=bool(classifier_cfg.get("bidirectional", True)),
                 dropout=float(classifier_cfg.get("dropout", 0.3)),
                 activation=str(classifier_cfg.get("activation", "relu")),
+                num_classes=int(classifier_cfg.get("num_classes", 1)),
             )
         else:
             raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")

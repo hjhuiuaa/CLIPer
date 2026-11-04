@@ -1,6 +1,22 @@
 # CLIPer
 **CLIPer** stands for **Contrastive Learning for Intrinsically disordered Protein linker classification**.
 
+## Paper model
+
+The model reported in the paper is the ternary supervised-contrastive CRNN:
+
+- Frozen ProstT5 residue embeddings (`Rostlab/ProstT5` on Hugging Face; weights are not in this repository)
+- One Conv1d layer (128 channels, kernel size 3) and one bidirectional GRU (hidden size 64)
+- Loss: binary cross-entropy on the linker logit plus ternary supervised contrastive learning, with weight 0.2
+- Config: `configs/ablation/shared_supcon.yaml`
+- Sequences: `dataset/t2_seqneg/` (`train.fasta`, `val.fasta`, `train_val.fasta`). Scene 1 test is `test_caid3.fasta`. Scene 2 test is `test_scene2_pdb62.fasta`
+- Split manifest: `artifacts/splits/t2_seqneg_split_seed42.json`
+- Classifier checkpoint: GitHub release `paper-supcon`, file `best.pt`
+
+Rebuild the split with `python scripts/build_t2_seqneg_split.py`. The count-matched operating threshold is computed by `python scripts/count_matched_threshold.py` on `train.fasta` only.
+
+The sections below record earlier development stages. They are not the paper model.
+
 Stage 1 provides a reproducible residue-level binary classifier pipeline for linker prediction:
 - **Task:** residue-level linker classification (`0` non-linker, `1` linker)
 - **Backbone:** pretrained **ProstT5** (frozen in v1)

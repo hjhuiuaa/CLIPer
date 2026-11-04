@@ -11,7 +11,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from cliper.windowing import build_eval_window_starts, merge_window_logits, sigmoid
+from cliper.windowing import build_eval_window_starts, linker_probs_from_logits, merge_window_logits
 from disorder.feature_modeling import DisorderFeatureClassifier
 
 from .caid_io import parse_caid_fasta, read_residue_embedding, write_caid_file, write_timings_csv
@@ -167,6 +167,8 @@ def predict_sequence_from_embedding(
     top_k_heuristic: int,
     device: torch.device,
     window_batch_size: int,
+    linker_class: int = 1,
+    dual_binary: bool = False,
 ) -> list[float]:
     base_hidden = int(embedding.shape[1])
     expected_input = int(base_hidden * _local_context_width(local_context))
@@ -200,7 +202,9 @@ def predict_sequence_from_embedding(
         window_pairs.extend(zip(chunk_starts, batch_logits))
 
     merged_logits = merge_window_logits(length=len(sequence), window_logits=window_pairs)
-    return sigmoid(merged_logits)
+    return linker_probs_from_logits(
+        merged_logits, linker_class=linker_class, dual_binary=dual_binary
+    )
 
 
 def predict_caid(
@@ -251,6 +255,8 @@ def predict_caid(
             top_k_heuristic=resolved_top_k,
             device=dev,
             window_batch_size=window_batch_size,
+            linker_class=int(dict(config.get("classifier_head", {})).get("linker_class", 1)),
+            dual_binary=bool(dict(config.get("classifier_head", {})).get("dual_binary", False)),
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         timings_ms.append((protein_id, elapsed_ms))
