@@ -1,11 +1,6 @@
 # classification-head weights are published as a GitHub release, not in the repo
 *.pt
 
-# training runs, downloaded checkpoints, and prediction outputs
-artifacts/*
-!artifacts/figures/
-!artifacts/figures/*.png
-
 # local ProstT5 checkout
 models/
 
@@ -28,6 +23,8 @@ venv/
 *.out
 *.synctex.gz
 *.toc
+# training logs live under artifacts/runs and should stay in the repo
+!artifacts/runs/**/*.log
 
 # local archives and editor files
 *.tar
