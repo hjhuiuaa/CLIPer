@@ -1,0 +1,1199 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from types import SimpleNamespace
+from typing import Any
+
+import torch
+from torch import nn
+
+from .windowing import normalize_sequence
+
+
+@dataclass
+class EncodedBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    residue_lengths: list[int]
+    token_residue_lengths: list[list[int]] | None = None
+
+
+class DummyProteinTokenizer:
+    def __init__(self) -> None:
+        alphabet = "ACDEFGHIKLMNPQRSTVWYX-"
+        self.is_dummy_tokenizer = True
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self._vocab = {aa: idx + 2 for idx, aa in enumerate(alphabet)}
+
+    def __len__(self) -> int:
+        return max(self._vocab.values(), default=self.eos_token_id) + 1
+
+    def add_special_tokens(self, payload: dict[str, list[str]]) -> int:
+        added = 0
+        for token in payload.get("additional_special_tokens", []):
+            if token in self._vocab:
+                continue
+            self._vocab[token] = len(self)
+            added += 1
+        return added
+
+    def get_vocab(self) -> dict[str, int]:
+        return dict(self._vocab)
+
+    def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]:
+        if isinstance(tokens, str):
+            return self._vocab.get(tokens, self._vocab["X"])
+        return [self.convert_tokens_to_ids(token) for token in tokens]
+
+    def __call__(self, sequences: list[str] | list[list[str]]) -> EncodedBatch:
+        token_sequences: list[list[str]] = []
+        residue_lengths: list[int] = []
+        for sequence in sequences:
+            if isinstance(sequence, list):
+                tokens = sequence
+            else:
+                tokens = list(sequence)
+            token_sequences.append(tokens)
+            residue_lengths.append(len(tokens))
+        tokenized = []
+        max_len = 0
+        for tokens in token_sequences:
+            ids = [self._vocab.get(token, self._vocab["X"]) for token in tokens]
+            ids.append(self.eos_token_id)
+            tokenized.append(ids)
+            max_len = max(max_len, len(ids))
+
+        input_ids = torch.full((len(sequences), max_len), self.pad_token_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(sequences), max_len), dtype=torch.long)
+        for row, ids in enumerate(tokenized):
+            input_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[row, : len(ids)] = 1
+        return EncodedBatch(input_ids=input_ids, attention_mask=attention_mask, residue_lengths=residue_lengths)
+
+
+class DummyBackbone(nn.Module):
+    def __init__(self, hidden_size: int = 64, vocab_size: int = 64) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.encoder = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=False)
+        self.config = SimpleNamespace(hidden_size=hidden_size)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> Any:
+        embedded = self.embedding(input_ids)
+        outputs, _ = self.encoder(embedded)
+        if attention_mask is not None:
+            outputs = outputs * attention_mask.unsqueeze(-1).to(outputs.dtype)
+        return SimpleNamespace(last_hidden_state=outputs)
+
+    def resize_token_embeddings(self, new_size: int) -> nn.Embedding:
+        old_embedding = self.embedding
+        if new_size == old_embedding.num_embeddings:
+            return old_embedding
+        new_embedding = nn.Embedding(new_size, old_embedding.embedding_dim)
+        copy_rows = min(old_embedding.num_embeddings, new_size)
+        with torch.no_grad():
+            new_embedding.weight[:copy_rows] = old_embedding.weight[:copy_rows]
+            if new_size > copy_rows:
+                nn.init.normal_(new_embedding.weight[copy_rows:], mean=0.0, std=0.02)
+        self.embedding = new_embedding
+        return self.embedding
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embedding
+
+
+def _build_activation(name: str) -> nn.Module:
+    key = name.lower()
+    if key == "relu":
+        return nn.ReLU()
+    if key == "gelu":
+        return nn.GELU()
+    raise ValueError(f"Unsupported classifier_head activation: {name!r}")
+
+
+def _build_padding_mask(residue_lengths: list[int], max_len: int, *, device: torch.device) -> torch.Tensor:
+    if max_len <= 0:
+        raise ValueError(f"max_len must be > 0, got {max_len}")
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=device)
+    if lengths.numel() == 0:
+        raise ValueError("residue_lengths must not be empty.")
+    if int(lengths.min().item()) <= 0:
+        raise ValueError(f"residue_lengths must contain positive values, got {residue_lengths!r}")
+    if int(lengths.max().item()) > max_len:
+        raise ValueError(f"residue_lengths contains value > max_len: max_len={max_len}, lengths={residue_lengths!r}")
+    positions = torch.arange(max_len, device=device).unsqueeze(0).expand(lengths.shape[0], max_len)
+    return positions >= lengths.unsqueeze(1)
+
+
+def _sinusoidal_position_encoding(length: int, dim: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    if length <= 0 or dim <= 0:
+        raise ValueError(f"length and dim must be > 0, got length={length}, dim={dim}")
+    positions = torch.arange(length, dtype=torch.float32, device=device).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, dim, 2, dtype=torch.float32, device=device) * (-math.log(10000.0) / float(dim))
+    )
+    pe = torch.zeros(length, dim, dtype=torch.float32, device=device)
+    pe[:, 0::2] = torch.sin(positions * div_term)
+    cos_width = pe[:, 1::2].shape[1]
+    if cos_width > 0:
+        pe[:, 1::2] = torch.cos(positions * div_term[:cos_width])
+    return pe.to(dtype=dtype)
+
+
+def _resolve_local_context(local_context: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(local_context or {})
+    enabled = bool(cfg.get("enabled", False))
+    radius = int(cfg.get("radius", 2))
+    mode = str(cfg.get("mode", "concat_window")).lower()
+    include_self = bool(cfg.get("include_self", True))
+    if radius < 0:
+        raise ValueError(f"local_context.radius must be >= 0, got {radius}")
+    if mode != "concat_window":
+        raise ValueError("local_context.mode must be 'concat_window' for ResidueClassifier.")
+    if enabled and radius == 0 and not include_self:
+        raise ValueError("local_context requires at least one feature when enabled.")
+    return {
+        "enabled": enabled,
+        "radius": radius,
+        "mode": mode,
+        "include_self": include_self,
+    }
+
+
+def _resolve_motif_config(motif: dict[str, Any] | None) -> dict[str, Any]:
+    cfg = dict(motif or {})
+    enabled = bool(cfg.get("enabled", False))
+    tokenization = str(cfg.get("tokenization", "special_token")).lower()
+    if tokenization in {"special", "special_tokens"}:
+        tokenization = "special_token"
+    if enabled and tokenization != "special_token":
+        raise ValueError("motif.tokenization only supports 'special_token'. Legacy fusion has been removed.")
+    return {
+        "enabled": enabled,
+        "tokenization": tokenization,
+    }
+
+
+def prepare_backbone_for_motif_tokenizer(
+    backbone: nn.Module,
+    tokenizer: Any,
+    special_tokens: list[str],
+) -> dict[str, Any]:
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+    missing = [token for token in special_tokens if token not in vocab]
+    if missing:
+        if bool(getattr(tokenizer, "is_dummy_tokenizer", False)):
+            tokenizer.add_special_tokens({"additional_special_tokens": missing})
+            vocab = tokenizer.get_vocab()
+            missing = [token for token in special_tokens if token not in vocab]
+        if missing:
+            raise ValueError(
+                "Trained tokenizer is missing motif special tokens. "
+                f"Missing sample: {missing[:10]}"
+            )
+    if not hasattr(tokenizer, "convert_tokens_to_ids"):
+        raise ValueError("Tokenizer does not support convert_tokens_to_ids.")
+    token_ids = tokenizer.convert_tokens_to_ids(list(special_tokens))
+    if not hasattr(backbone, "resize_token_embeddings"):
+        raise ValueError("Backbone does not support resize_token_embeddings for motif tokenizer.")
+    embedding = backbone.resize_token_embeddings(len(tokenizer))
+    return {
+        "tokens": list(special_tokens),
+        "token_ids": [int(token_id) for token_id in token_ids],
+        "added_count": 0,
+        "tokenizer_length": len(tokenizer),
+        "embedding_rows": int(embedding.num_embeddings),
+    }
+
+
+def configure_trainable_token_embeddings(backbone: nn.Module, token_ids: list[int]) -> None:
+    if not token_ids:
+        return
+    if not hasattr(backbone, "get_input_embeddings"):
+        raise ValueError("Backbone does not expose get_input_embeddings.")
+    embedding = backbone.get_input_embeddings()
+    if embedding is None or not hasattr(embedding, "weight"):
+        raise ValueError("Backbone input embeddings are unavailable.")
+    unique_ids = sorted({int(token_id) for token_id in token_ids})
+    embedding.weight.requires_grad = True
+
+    def _mask_old_token_grads(grad: torch.Tensor) -> torch.Tensor:
+        mask = torch.zeros((grad.shape[0], 1), dtype=grad.dtype, device=grad.device)
+        valid_ids = [token_id for token_id in unique_ids if 0 <= token_id < grad.shape[0]]
+        if valid_ids:
+            mask[torch.tensor(valid_ids, dtype=torch.long, device=grad.device)] = 1
+        return grad * mask
+
+    embedding.weight.register_hook(_mask_old_token_grads)
+
+
+def _broadcast_token_hidden_to_residues(
+    token_hidden: torch.Tensor,
+    token_residue_lengths: list[list[int]],
+    residue_lengths: list[int],
+) -> torch.Tensor:
+    batch_size, token_count, hidden_size = token_hidden.shape
+    if len(token_residue_lengths) != batch_size:
+        raise ValueError(
+            "token_residue_lengths batch size mismatch: "
+            f"{len(token_residue_lengths)} vs hidden batch {batch_size}"
+        )
+    max_residue_len = max(residue_lengths)
+    residue_hidden = token_hidden.new_zeros((batch_size, max_residue_len, hidden_size))
+    for row, (span_lengths, residue_len) in enumerate(zip(token_residue_lengths, residue_lengths)):
+        cursor = 0
+        if len(span_lengths) > token_count:
+            raise ValueError(
+                f"token_residue_lengths[{row}] has {len(span_lengths)} tokens but backbone returned {token_count}."
+            )
+        for token_idx, raw_span_len in enumerate(span_lengths):
+            span_len = int(raw_span_len)
+            if span_len <= 0:
+                raise ValueError(f"token span lengths must be positive, got {span_len} at row={row} token={token_idx}")
+            end = min(cursor + span_len, residue_len)
+            if end > cursor:
+                residue_hidden[row, cursor:end, :] = token_hidden[row, token_idx, :]
+            cursor = end
+            if cursor >= residue_len:
+                break
+        if cursor != residue_len:
+            raise ValueError(
+                f"Token-to-residue alignment did not cover sequence row={row}: "
+                f"covered={cursor} residue_len={residue_len} span_lengths={span_lengths!r}"
+            )
+    return residue_hidden
+
+
+def _local_context_multiplier(local_context: dict[str, Any]) -> int:
+    if not bool(local_context.get("enabled", False)):
+        return 1
+    radius = int(local_context.get("radius", 2))
+    include_self = bool(local_context.get("include_self", True))
+    span = (2 * radius + 1) if include_self else (2 * radius)
+    if span <= 0:
+        raise ValueError("local_context produced empty span; check radius/include_self.")
+    return span
+
+
+def _concat_local_window(x: torch.Tensor, residue_lengths: list[int], local_context: dict[str, Any]) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError(f"Expected [B, L, H] input, got {tuple(x.shape)}")
+    if not bool(local_context.get("enabled", False)):
+        return x
+    radius = int(local_context.get("radius", 2))
+    if radius <= 0:
+        return x
+
+    include_self = bool(local_context.get("include_self", True))
+    batch, max_len, _ = x.shape
+    lengths = torch.tensor(residue_lengths, device=x.device, dtype=torch.long)
+    if int(lengths.max().item()) > max_len:
+        raise ValueError(f"residue_lengths has value > max_len ({max_len}): {residue_lengths!r}")
+    valid_mask = torch.arange(max_len, device=x.device).unsqueeze(0).expand(batch, max_len) < lengths.unsqueeze(1)
+    x = x * valid_mask.unsqueeze(-1).to(x.dtype)
+    positions = torch.arange(max_len, device=x.device)
+
+    chunks: list[torch.Tensor] = []
+    for offset in range(-radius, radius + 1):
+        if offset == 0 and not include_self:
+            continue
+        idx = positions + offset
+        in_bounds = (idx >= 0) & (idx < max_len)
+        safe_idx = idx.clamp(min=0, max=max_len - 1)
+        shifted = x[:, safe_idx, :]
+        neighbor_valid = valid_mask[:, safe_idx] & in_bounds.unsqueeze(0)
+        shifted = shifted * neighbor_valid.unsqueeze(-1).to(shifted.dtype)
+        chunks.append(shifted)
+    if not chunks:
+        raise ValueError("local_context concat_window produced no chunks.")
+    return torch.cat(chunks, dim=-1)
+
+
+class MLPClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dims: list[int],
+        *,
+        dropout: float,
+        dropout_schedule: list[float] | None = None,
+        activation: str,
+        use_layernorm: bool,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = []
+        in_dim = input_dim
+        if dropout_schedule is None:
+            per_layer_dropout = [float(dropout)] * len(hidden_dims)
+        else:
+            if len(dropout_schedule) != len(hidden_dims):
+                raise ValueError(
+                    "classifier_head.dropout_schedule length must match hidden_dims length: "
+                    f"{len(dropout_schedule)} vs {len(hidden_dims)}"
+                )
+            per_layer_dropout = [float(x) for x in dropout_schedule]
+            for value in per_layer_dropout:
+                if not (0.0 <= value < 1.0):
+                    raise ValueError(f"classifier_head.dropout_schedule values must be in [0,1), got {value}")
+        for hidden_order, hidden_dim in enumerate(hidden_dims):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            if use_layernorm:
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(per_layer_dropout[hidden_order]))
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+class TransformerClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        num_layers: int,
+        num_heads: int,
+        ffn_dim: int,
+        dropout: float,
+        activation: str,
+        use_positional_encoding: bool,
+    ) -> None:
+        super().__init__()
+        activation_key = activation.lower()
+        if activation_key not in {"relu", "gelu"}:
+            raise ValueError(f"Unsupported classifier_head activation for transformer: {activation!r}")
+        if num_layers <= 0:
+            raise ValueError(f"classifier_head.num_layers must be > 0, got {num_layers}")
+        if num_heads <= 0:
+            raise ValueError(f"classifier_head.num_heads must be > 0, got {num_heads}")
+        if ffn_dim <= 0:
+            raise ValueError(f"classifier_head.ffn_dim must be > 0, got {ffn_dim}")
+        if input_dim % num_heads != 0:
+            raise ValueError(
+                "Transformer classifier_head requires hidden_size divisible by num_heads, "
+                f"got hidden_size={input_dim}, num_heads={num_heads}"
+            )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=input_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            activation=activation_key,
+            batch_first=True,
+        )
+        self.use_positional_encoding = bool(use_positional_encoding)
+        self.input_dropout = nn.Dropout(dropout)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.classifier = nn.Linear(input_dim, 1)
+
+    def forward(self, x: torch.Tensor, *, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        if self.use_positional_encoding:
+            x = x + _sinusoidal_position_encoding(
+                length=x.shape[1],
+                dim=x.shape[2],
+                device=x.device,
+                dtype=x.dtype,
+            ).unsqueeze(0)
+        encoded = self.encoder(self.input_dropout(x), src_key_padding_mask=padding_mask)
+        return self.classifier(encoded)
+
+
+def _build_rnn_module(
+    *,
+    rnn_type: str,
+    input_size: int,
+    hidden_size: int,
+    num_layers: int,
+    bidirectional: bool,
+    dropout: float,
+) -> nn.GRU | nn.LSTM:
+    """Construct a batch-first GRU/LSTM with validated hyperparameters."""
+    key = rnn_type.lower()
+    if key not in {"gru", "lstm"}:
+        raise ValueError(f"classifier_head.rnn_type must be one of ['gru', 'lstm'], got {rnn_type!r}")
+    if input_size <= 0:
+        raise ValueError(f"rnn input_size must be > 0, got {input_size}")
+    if hidden_size <= 0:
+        raise ValueError(f"classifier_head.rnn_hidden_size must be > 0, got {hidden_size}")
+    if num_layers <= 0:
+        raise ValueError(f"classifier_head.rnn_num_layers must be > 0, got {num_layers}")
+    rnn_cls = nn.GRU if key == "gru" else nn.LSTM
+    return rnn_cls(
+        input_size=input_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        batch_first=True,
+        bidirectional=bidirectional,
+        # Inter-layer dropout is only meaningful with stacked layers.
+        dropout=float(dropout) if num_layers > 1 else 0.0,
+    )
+
+
+def _run_rnn_over_residues(
+    rnn: nn.GRU | nn.LSTM,
+    x: torch.Tensor,
+    residue_lengths: list[int],
+) -> torch.Tensor:
+    """Run an RNN along the residue axis, ignoring padded tail positions.
+
+    Variable-length sequences are packed so the recurrence never consumes
+    padding, then re-padded back to the original [B, L, H_out] shape.
+    """
+    if x.dim() != 3:
+        raise ValueError(f"Expected [B, L, H] RNN input, got {tuple(x.shape)}")
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=x.device)
+    if lengths.numel() != x.shape[0]:
+        raise ValueError(
+            f"residue_lengths batch size {lengths.numel()} != input batch {x.shape[0]}"
+        )
+    if int(lengths.min().item()) <= 0:
+        raise ValueError(f"residue_lengths must be positive, got {residue_lengths!r}")
+    if int(lengths.max().item()) > x.shape[1]:
+        raise ValueError(
+            f"residue_lengths has value > sequence length ({x.shape[1]}): {residue_lengths!r}"
+        )
+    packed = nn.utils.rnn.pack_padded_sequence(
+        x,
+        lengths.cpu(),
+        batch_first=True,
+        enforce_sorted=False,
+    )
+    outputs, _ = rnn(packed)
+    outputs, _ = nn.utils.rnn.pad_packed_sequence(
+        outputs, batch_first=True, total_length=x.shape[1]
+    )
+    return outputs
+
+
+def _mask_padded_logits(logits: torch.Tensor, residue_lengths: list[int]) -> torch.Tensor:
+    """Zero out logits beyond each sequence's true length (hygiene for padded tails)."""
+    if logits.dim() != 3 or logits.shape[-1] < 1:
+        raise ValueError(f"Expected [B, L, C] logits with C>=1, got {tuple(logits.shape)}")
+    max_len = logits.shape[1]
+    lengths = torch.tensor(residue_lengths, dtype=torch.long, device=logits.device)
+    valid = torch.arange(max_len, device=logits.device).unsqueeze(0) < lengths.unsqueeze(1)
+    return logits * valid.unsqueeze(-1).to(logits.dtype)
+
+
+class RNNClassifierHead(nn.Module):
+    """Bidirectional RNN over per-residue features to favor contiguous linker segments.
+
+    A residue is rarely an isolated linker; linkers come in runs. A bidirectional
+    recurrence lets each position aggregate evidence from both neighboring directions
+    along the whole window, smoothing out spurious single-residue predictions.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        hidden_size: int,
+        num_layers: int,
+        rnn_type: str,
+        bidirectional: bool,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"rnn input_dim must be > 0, got {input_dim}")
+        self.input_proj = nn.Linear(input_dim, hidden_size)
+        self.input_dropout = nn.Dropout(dropout)
+        self.rnn = _build_rnn_module(
+            rnn_type=rnn_type,
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+        )
+        out_dim = hidden_size * (2 if bidirectional else 1)
+        self.encoded_dim = out_dim
+        self.norm = nn.LayerNorm(out_dim)
+        self.output_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(out_dim, 1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residue_lengths: list[int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        projected = self.input_dropout(self.input_proj(x))
+        encoded = _run_rnn_over_residues(self.rnn, projected, residue_lengths)
+        encoded = self.output_dropout(self.norm(encoded))
+        logits = _mask_padded_logits(self.classifier(encoded), residue_lengths)
+        if return_hidden:
+            return logits, encoded
+        return logits
+
+
+class CRNNClassifierHead(nn.Module):
+    """CNN local features followed by a bidirectional RNN for sequence-level continuity.
+
+    The Conv1d stack captures local linker motifs (like Stage 4), while the RNN
+    propagates that signal across the sequence to enforce contiguity between regions.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        conv_channels: list[int],
+        kernel_size: int,
+        dilations: list[int] | None,
+        rnn_hidden_size: int,
+        rnn_num_layers: int,
+        rnn_type: str,
+        bidirectional: bool,
+        dropout: float,
+        activation: str,
+        num_classes: int = 1,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"crnn input_dim must be > 0, got {input_dim}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+        if not conv_channels:
+            raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+        channels = [int(ch) for ch in conv_channels]
+        if any(ch <= 0 for ch in channels):
+            raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+        if dilations is None:
+            dils = [1] * len(channels)
+        else:
+            if len(dilations) != len(channels):
+                raise ValueError(
+                    "classifier_head.dilations length must match conv_channels length: "
+                    f"{len(dilations)} vs {len(channels)}"
+                )
+            dils = [int(d) for d in dilations]
+            if any(d <= 0 for d in dils):
+                raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+        num_classes = int(num_classes)
+        if num_classes < 1:
+            raise ValueError(f"classifier_head.num_classes must be >= 1, got {num_classes}")
+        self.num_classes = num_classes
+
+        layers: list[nn.Module] = []
+        in_ch = input_dim
+        for out_ch, dil in zip(channels, dils):
+            # Symmetric padding keeps the residue axis length unchanged.
+            pad = dil * (kernel_size - 1) // 2
+            layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, dilation=dil))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            in_ch = out_ch
+        self.conv = nn.Sequential(*layers)
+        self.rnn_dropout = nn.Dropout(dropout)
+        self.rnn = _build_rnn_module(
+            rnn_type=rnn_type,
+            input_size=channels[-1],
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            bidirectional=bidirectional,
+            dropout=dropout,
+        )
+        out_dim = rnn_hidden_size * (2 if bidirectional else 1)
+        self.encoded_dim = out_dim
+        self.norm = nn.LayerNorm(out_dim)
+        self.output_dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(out_dim, num_classes)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residue_lengths: list[int],
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # [B, L, H] -> [B, H, L] for conv1d along residues, then back to [B, L, C].
+        y = self.conv(x.transpose(1, 2)).transpose(1, 2)
+        y = self.rnn_dropout(y)
+        encoded = _run_rnn_over_residues(self.rnn, y, residue_lengths)
+        encoded = self.output_dropout(self.norm(encoded))
+        logits = _mask_padded_logits(self.classifier(encoded), residue_lengths)
+        if return_hidden:
+            return logits, encoded
+        return logits
+
+
+class CNNClassifierHead(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        *,
+        conv_channels: list[int],
+        kernel_size: int,
+        dilations: list[int] | None,
+        dropout: float,
+        activation: str,
+    ) -> None:
+        super().__init__()
+        if input_dim <= 0:
+            raise ValueError(f"cnn input_dim must be > 0, got {input_dim}")
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"classifier_head.kernel_size must be a positive odd integer, got {kernel_size}")
+        if not conv_channels:
+            raise ValueError("classifier_head.conv_channels must be a non-empty list.")
+        channels = [int(ch) for ch in conv_channels]
+        if any(ch <= 0 for ch in channels):
+            raise ValueError(f"classifier_head.conv_channels must be > 0, got {conv_channels!r}")
+        if dilations is None:
+            dils = [1] * len(channels)
+        else:
+            if len(dilations) != len(channels):
+                raise ValueError(
+                    "classifier_head.dilations length must match conv_channels length: "
+                    f"{len(dilations)} vs {len(channels)}"
+                )
+            dils = [int(d) for d in dilations]
+            if any(d <= 0 for d in dils):
+                raise ValueError(f"classifier_head.dilations must be > 0, got {dilations!r}")
+
+        layers: list[nn.Module] = []
+        in_ch = input_dim
+        for out_ch, dil in zip(channels, dils):
+            pad = dil * (kernel_size - 1) // 2
+            layers.append(nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, padding=pad, dilation=dil))
+            layers.append(_build_activation(activation))
+            layers.append(nn.Dropout(dropout))
+            in_ch = out_ch
+        self.conv = nn.Sequential(*layers)
+        self.classifier = nn.Conv1d(in_ch, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [B, L, H] -> [B, H, L] for conv1d along residues.
+        y = x.transpose(1, 2)
+        y = self.conv(y)
+        y = self.classifier(y)
+        return y.transpose(1, 2)
+
+
+class ResidueClassifier(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        hidden_size: int,
+        dropout: float = 0.1,
+        freeze_backbone: bool = True,
+        projection_dim: int = 128,
+        proj_hidden: int | None = None,
+        classifier_head: dict[str, Any] | None = None,
+        local_context: dict[str, Any] | None = None,
+        motif: dict[str, Any] | None = None,
+        motif_vocab_size: int = 0,
+    ):
+        super().__init__()
+        self.backbone = backbone
+        self.freeze_backbone = freeze_backbone
+        self.dropout = nn.Dropout(dropout)
+        self.local_context = _resolve_local_context(local_context)
+        self.motif = _resolve_motif_config(motif)
+        self.motif_enabled = bool(self.motif.get("enabled", False))
+        self.motif_tokenization = str(self.motif.get("tokenization", "special_token"))
+        self.motif_vocab_size = int(max(0, motif_vocab_size))
+        classifier_input_dim = hidden_size * _local_context_multiplier(self.local_context)
+
+        classifier_cfg = dict(classifier_head or {})
+        head_type = str(classifier_cfg.get("type", "linear")).lower()
+        self.classifier_type = head_type
+        if head_type == "linear":
+            self.classifier = nn.Linear(classifier_input_dim, 1)
+        elif head_type in {"mlp3", "mlp5", "mlp12"}:
+            default_hidden_dims_map: dict[str, list[int]] = {
+                "mlp3": [128, 64, 32],
+                "mlp5": [1024, 256, 128, 64],
+                "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
+            }
+            expected_hidden_layers = {"mlp3": 3, "mlp5": 4, "mlp12": 11}[head_type]
+            hidden_dims_raw = classifier_cfg.get("hidden_dims", default_hidden_dims_map[head_type])
+            if not isinstance(hidden_dims_raw, list) or len(hidden_dims_raw) != expected_hidden_layers:
+                raise ValueError(
+                    f"classifier_head.hidden_dims for {head_type} must be a list of "
+                    f"{expected_hidden_layers} integers, got {hidden_dims_raw!r}"
+                )
+            hidden_dims = [int(dim) for dim in hidden_dims_raw]
+            if any(dim <= 0 for dim in hidden_dims):
+                raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims_raw!r}")
+            if head_type == "mlp3" and any(dim > 128 for dim in hidden_dims):
+                raise ValueError(
+                    "classifier_head.hidden_dims for mlp3 must use widths <= 128, "
+                    f"got {hidden_dims_raw!r}"
+                )
+            self.classifier = MLPClassifierHead(
+                input_dim=classifier_input_dim,
+                hidden_dims=hidden_dims,
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                dropout_schedule=(
+                    [float(x) for x in classifier_cfg["dropout_schedule"]]
+                    if isinstance(classifier_cfg.get("dropout_schedule"), list)
+                    else None
+                ),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_layernorm=bool(classifier_cfg.get("use_layernorm", True)),
+            )
+        elif head_type == "transformer":
+            self.classifier = TransformerClassifierHead(
+                input_dim=classifier_input_dim,
+                num_layers=int(classifier_cfg.get("num_layers", 2)),
+                num_heads=int(classifier_cfg.get("num_heads", 4)),
+                ffn_dim=int(classifier_cfg.get("ffn_dim", 2048)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_positional_encoding=bool(classifier_cfg.get("use_positional_encoding", True)),
+            )
+        elif head_type == "cnn":
+            self.classifier = CNNClassifierHead(
+                input_dim=classifier_input_dim,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+            )
+        elif head_type == "rnn":
+            self.classifier = RNNClassifierHead(
+                input_dim=classifier_input_dim,
+                hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+            )
+        elif head_type == "crnn":
+            self.classifier = CRNNClassifierHead(
+                input_dim=classifier_input_dim,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                rnn_hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                rnn_num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                num_classes=int(classifier_cfg.get("num_classes", 1)),
+            )
+        else:
+            raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
+
+        self.num_classes = int(getattr(self.classifier, "num_classes", 1))
+        if head_type != "crnn":
+            self.num_classes = 1
+        proj_mid = hidden_size if proj_hidden is None else int(proj_hidden)
+        if proj_mid <= 0:
+            raise ValueError(f"proj_hidden must be > 0, got {proj_mid}")
+        # RNN/CRNN: project the state that the classification layer reads, so
+        # contrastive gradients update the conv/GRU. Other heads still project
+        # the frozen local features.
+        if head_type in {"rnn", "crnn"}:
+            proj_in = int(self.classifier.encoded_dim)
+        else:
+            proj_in = classifier_input_dim
+        self.projection_head = nn.Sequential(
+            nn.Linear(proj_in, proj_mid),
+            nn.ReLU(),
+            nn.Linear(proj_mid, projection_dim),
+        )
+        if self.freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        residue_lengths: list[int] | None = None,
+        *,
+        residue_hidden: torch.Tensor | None = None,
+        token_residue_lengths: list[list[int]] | None = None,
+        return_embeddings: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residue_hidden is not None:
+            if residue_hidden.dim() != 3:
+                raise ValueError(
+                    f"residue_hidden must be [B, L, H], got shape={tuple(residue_hidden.shape)}"
+                )
+            if residue_lengths is None:
+                residue_lengths = [int(residue_hidden.shape[1])] * int(residue_hidden.shape[0])
+            max_len = max(residue_lengths)
+            if residue_hidden.shape[1] < max_len:
+                raise ValueError(
+                    f"residue_hidden length {residue_hidden.shape[1]} is smaller than "
+                    f"requested residue length {max_len}."
+                )
+            residue_hidden = residue_hidden[:, :max_len, :]
+        else:
+            if input_ids is None or attention_mask is None or residue_lengths is None:
+                raise ValueError(
+                    "forward requires either residue_hidden or (input_ids, attention_mask, residue_lengths)."
+                )
+            keep_backbone_graph = self.motif_enabled and token_residue_lengths is not None
+            if self.freeze_backbone:
+                self.backbone.eval()
+            if self.freeze_backbone and not keep_backbone_graph:
+                with torch.no_grad():
+                    outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            else:
+                outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+
+            hidden = outputs.last_hidden_state
+            max_len = max(residue_lengths)
+            if token_residue_lengths is not None:
+                residue_hidden = _broadcast_token_hidden_to_residues(hidden, token_residue_lengths, residue_lengths)
+            elif hidden.shape[1] < max_len:
+                raise ValueError(
+                    f"Backbone output length {hidden.shape[1]} is smaller than requested residue length {max_len}."
+                )
+            else:
+                residue_hidden = hidden[:, :max_len, :]
+        contextual_hidden = _concat_local_window(residue_hidden, residue_lengths, self.local_context)
+        classifier_input = self.dropout(contextual_hidden)
+        contrastive_hidden = None
+        if self.classifier_type == "transformer":
+            padding_mask = _build_padding_mask(residue_lengths, max_len, device=classifier_input.device)
+            raw_logits = self.classifier(classifier_input, padding_mask=padding_mask)
+        elif self.classifier_type in {"rnn", "crnn"}:
+            if return_embeddings:
+                raw_logits, contrastive_hidden = self.classifier(
+                    classifier_input,
+                    residue_lengths=residue_lengths,
+                    return_hidden=True,
+                )
+            else:
+                raw_logits = self.classifier(classifier_input, residue_lengths=residue_lengths)
+        else:
+            raw_logits = self.classifier(classifier_input)
+        if raw_logits.shape[-1] == 1:
+            logits = raw_logits.squeeze(-1)
+        else:
+            logits = raw_logits
+        if not return_embeddings:
+            return logits
+        if contrastive_hidden is None:
+            embeddings = self.projection_head(classifier_input)
+        else:
+            embeddings = self.projection_head(contrastive_hidden)
+        return logits, embeddings
+
+
+class DualTokenizerResidueClassifier(nn.Module):
+    def __init__(
+        self,
+        *,
+        plain_model: ResidueClassifier,
+        special_model: ResidueClassifier,
+        plain_weight: float,
+        special_weight: float,
+    ) -> None:
+        super().__init__()
+        self.plain_model = plain_model
+        self.special_model = special_model
+        self.plain_weight = float(plain_weight)
+        self.special_weight = float(special_weight)
+
+    def forward(
+        self,
+        *,
+        plain_input_ids: torch.Tensor,
+        plain_attention_mask: torch.Tensor,
+        plain_residue_lengths: list[int],
+        special_input_ids: torch.Tensor,
+        special_attention_mask: torch.Tensor,
+        special_residue_lengths: list[int],
+        special_token_residue_lengths: list[list[int]] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if plain_residue_lengths != special_residue_lengths:
+            raise ValueError(
+                "Dual tokenizer branches produced different residue lengths: "
+                f"plain={plain_residue_lengths!r} special={special_residue_lengths!r}"
+            )
+        plain_logits = self.plain_model(
+            input_ids=plain_input_ids,
+            attention_mask=plain_attention_mask,
+            residue_lengths=plain_residue_lengths,
+        )
+        special_logits = self.special_model(
+            input_ids=special_input_ids,
+            attention_mask=special_attention_mask,
+            residue_lengths=special_residue_lengths,
+            token_residue_lengths=special_token_residue_lengths,
+        )
+        if plain_logits.shape != special_logits.shape:
+            raise ValueError(
+                "Dual tokenizer branch logits shape mismatch: "
+                f"plain={tuple(plain_logits.shape)} special={tuple(special_logits.shape)}"
+            )
+        fused_logits = self.plain_weight * plain_logits + self.special_weight * special_logits
+        return {
+            "plain_logits": plain_logits,
+            "special_logits": special_logits,
+            "fused_logits": fused_logits,
+        }
+
+
+def _resolve_hidden_size(backbone: nn.Module) -> int:
+    config = getattr(backbone, "config", None)
+    if config is None:
+        raise ValueError("Backbone has no config attribute; cannot infer hidden size.")
+    for attr in ("hidden_size", "d_model", "dim"):
+        value = getattr(config, attr, None)
+        if isinstance(value, int):
+            return value
+    raise ValueError("Cannot infer hidden size from backbone config.")
+
+
+def load_backbone_and_tokenizer(backbone_name: str, tokenizer_name: str | None = None) -> tuple[nn.Module, Any, int]:
+    if backbone_name.lower() == "dummy":
+        tokenizer = DummyProteinTokenizer()
+        backbone = DummyBackbone()
+        hidden_size = _resolve_hidden_size(backbone)
+        return backbone, tokenizer, hidden_size
+
+    try:
+        from transformers import AutoConfig, AutoModel, AutoTokenizer, T5EncoderModel
+    except ImportError as exc:
+        raise ImportError(
+            "transformers is required for non-dummy backbones. Install dependencies before training/evaluation."
+        ) from exc
+
+    tokenizer_source = tokenizer_name or backbone_name
+    # ProstT5 ships SentencePiece (spiece.model); slow tokenizer avoids fast-path Unigram errors in Docker.
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_source,
+        do_lower_case=False,
+        use_fast=False,
+    )
+    config = AutoConfig.from_pretrained(backbone_name)
+    if getattr(config, "model_type", None) == "t5":
+        backbone = T5EncoderModel.from_pretrained(backbone_name)
+    else:
+        backbone = AutoModel.from_pretrained(backbone_name)
+    hidden_size = _resolve_hidden_size(backbone)
+    return backbone, tokenizer, hidden_size
+
+
+def _adjust_lengths_for_attention(attention_mask: torch.Tensor, residue_lengths: list[int]) -> list[int]:
+    adjusted: list[int] = []
+    for idx, seq_len in enumerate(residue_lengths):
+        token_count = int(attention_mask[idx].sum().item())
+        # For ProtT5/ProstT5 this is usually (residue_len + eos). Keep robust fallback.
+        max_residues = max(1, token_count - 1)
+        if max_residues < seq_len:
+            max_residues = token_count
+        if max_residues < seq_len:
+            raise ValueError(
+                f"Tokenizer produced fewer tokens ({token_count}) than residues ({seq_len}) for sample index {idx}."
+            )
+        adjusted.append(min(seq_len, max_residues))
+    return adjusted
+
+
+def encode_sequences(tokenizer: Any, backbone_name: str, sequences: list[str]) -> EncodedBatch:
+    normalized = [normalize_sequence(seq) for seq in sequences]
+    if backbone_name.lower() == "dummy":
+        return tokenizer(normalized)
+
+    spaced = [" ".join(list(seq)) for seq in normalized]
+    encoded = tokenizer(
+        spaced,
+        add_special_tokens=True,
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+    )
+    residue_lengths = _adjust_lengths_for_attention(
+        attention_mask=encoded["attention_mask"],
+        residue_lengths=[len(seq) for seq in normalized],
+    )
+    return EncodedBatch(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        residue_lengths=residue_lengths,
+    )
+
+
+def encode_token_sequences(
+    tokenizer: Any,
+    backbone_name: str,
+    token_sequences: list[list[str]],
+    token_residue_lengths: list[list[int]],
+) -> EncodedBatch:
+    if len(token_sequences) != len(token_residue_lengths):
+        raise ValueError(
+            "token_sequences/token_residue_lengths batch size mismatch: "
+            f"{len(token_sequences)} vs {len(token_residue_lengths)}"
+        )
+    residue_lengths = [sum(int(span_len) for span_len in spans) for spans in token_residue_lengths]
+    for idx, (tokens, spans) in enumerate(zip(token_sequences, token_residue_lengths)):
+        if len(tokens) != len(spans):
+            raise ValueError(
+                f"Token alignment mismatch for sample {idx}: tokens={len(tokens)} spans={len(spans)}"
+            )
+        if any(int(span_len) <= 0 for span_len in spans):
+            raise ValueError(f"All token residue spans must be positive for sample {idx}: {spans!r}")
+
+    if backbone_name.lower() == "dummy":
+        encoded = tokenizer(token_sequences)
+        return EncodedBatch(
+            input_ids=encoded.input_ids,
+            attention_mask=encoded.attention_mask,
+            residue_lengths=residue_lengths,
+            token_residue_lengths=token_residue_lengths,
+        )
+
+    spaced = [" ".join(tokens) for tokens in token_sequences]
+    encoded = tokenizer(
+        spaced,
+        add_special_tokens=True,
+        padding=True,
+        truncation=False,
+        return_tensors="pt",
+    )
+    token_counts = [len(tokens) for tokens in token_sequences]
+    for idx, expected_tokens in enumerate(token_counts):
+        actual_tokens = int(encoded["attention_mask"][idx].sum().item())
+        # ProstT5-style tokenizers append EOS, so actual count should normally be expected + 1.
+        if actual_tokens < expected_tokens:
+            raise ValueError(
+                f"Tokenizer produced fewer tokens than motif-tokenized input for sample {idx}: "
+                f"actual={actual_tokens} expected_at_least={expected_tokens}"
+            )
+    return EncodedBatch(
+        input_ids=encoded["input_ids"],
+        attention_mask=encoded["attention_mask"],
+        residue_lengths=residue_lengths,
+        token_residue_lengths=token_residue_lengths,
+    )
+
+
+class EmbeddingClassifier(nn.Module):
+    """Same heads as ResidueClassifier, but forward takes [B, L, hidden] embeddings."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        dropout: float = 0.1,
+        classifier_head: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(float(dropout))
+        classifier_cfg = dict(classifier_head or {})
+        head_type = str(classifier_cfg.get("type", "linear")).lower()
+        self.classifier_type = head_type
+        if head_type == "linear":
+            self.classifier = nn.Linear(hidden_size, 1)
+        elif head_type in {"mlp3", "mlp5", "mlp12"}:
+            default_hidden_dims_map: dict[str, list[int]] = {
+                "mlp3": [128, 64, 32],
+                "mlp5": [1024, 256, 128, 64],
+                "mlp12": [1024, 1024, 768, 768, 512, 512, 256, 256, 128, 128, 64],
+            }
+            expected_hidden_layers = {"mlp3": 3, "mlp5": 4, "mlp12": 11}[head_type]
+            hidden_dims_raw = classifier_cfg.get("hidden_dims", default_hidden_dims_map[head_type])
+            if not isinstance(hidden_dims_raw, list) or len(hidden_dims_raw) != expected_hidden_layers:
+                raise ValueError(
+                    f"classifier_head.hidden_dims for {head_type} must be a list of "
+                    f"{expected_hidden_layers} integers, got {hidden_dims_raw!r}"
+                )
+            hidden_dims = [int(dim) for dim in hidden_dims_raw]
+            if any(dim <= 0 for dim in hidden_dims):
+                raise ValueError(f"classifier_head.hidden_dims must be > 0, got {hidden_dims_raw!r}")
+            if head_type == "mlp3" and any(dim > 128 for dim in hidden_dims):
+                raise ValueError(
+                    "classifier_head.hidden_dims for mlp3 must use widths <= 128, "
+                    f"got {hidden_dims_raw!r}"
+                )
+            self.classifier = MLPClassifierHead(
+                input_dim=hidden_size,
+                hidden_dims=hidden_dims,
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                dropout_schedule=(
+                    [float(x) for x in classifier_cfg["dropout_schedule"]]
+                    if isinstance(classifier_cfg.get("dropout_schedule"), list)
+                    else None
+                ),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_layernorm=bool(classifier_cfg.get("use_layernorm", True)),
+            )
+        elif head_type == "transformer":
+            self.classifier = TransformerClassifierHead(
+                input_dim=hidden_size,
+                num_layers=int(classifier_cfg.get("num_layers", 2)),
+                num_heads=int(classifier_cfg.get("num_heads", 4)),
+                ffn_dim=int(classifier_cfg.get("ffn_dim", 2048)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                use_positional_encoding=bool(classifier_cfg.get("use_positional_encoding", True)),
+            )
+        elif head_type == "cnn":
+            self.classifier = CNNClassifierHead(
+                input_dim=hidden_size,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+            )
+        elif head_type == "rnn":
+            self.classifier = RNNClassifierHead(
+                input_dim=hidden_size,
+                hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+            )
+        elif head_type == "crnn":
+            self.classifier = CRNNClassifierHead(
+                input_dim=hidden_size,
+                conv_channels=[int(ch) for ch in classifier_cfg.get("conv_channels", [256, 256])],
+                kernel_size=int(classifier_cfg.get("kernel_size", 3)),
+                dilations=(
+                    [int(d) for d in classifier_cfg["dilations"]]
+                    if isinstance(classifier_cfg.get("dilations"), list)
+                    else None
+                ),
+                rnn_hidden_size=int(classifier_cfg.get("rnn_hidden_size", 256)),
+                rnn_num_layers=int(classifier_cfg.get("rnn_num_layers", 2)),
+                rnn_type=str(classifier_cfg.get("rnn_type", "gru")),
+                bidirectional=bool(classifier_cfg.get("bidirectional", True)),
+                dropout=float(classifier_cfg.get("dropout", 0.3)),
+                activation=str(classifier_cfg.get("activation", "relu")),
+                num_classes=int(classifier_cfg.get("num_classes", 1)),
+            )
+        else:
+            raise ValueError(f"Unsupported classifier_head.type: {head_type!r}")
+
+    def forward(self, residue_embeddings: torch.Tensor, residue_lengths: list[int]) -> torch.Tensor:
+        if residue_embeddings.dim() != 3:
+            raise ValueError(f"Expected embeddings [B, L, H], got {tuple(residue_embeddings.shape)}")
+        x = self.dropout(residue_embeddings)
+        max_len = int(x.shape[1])
+        if self.classifier_type == "transformer":
+            padding_mask = _build_padding_mask(residue_lengths, max_len, device=x.device)
+            logits = self.classifier(x, padding_mask=padding_mask).squeeze(-1)
+        elif self.classifier_type in {"rnn", "crnn"}:
+            logits = self.classifier(x, residue_lengths=residue_lengths).squeeze(-1)
+        else:
+            logits = self.classifier(x).squeeze(-1)
+        return logits

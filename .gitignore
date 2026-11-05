@@ -1,28 +1,33 @@
-
-# local legacy splits (keep local, do not track)
-dataset/disprot9.5/train.fasta
-dataset/disprot9.5/valid.fasta
-
-dataset/train.fasta
-dataset/valid.fasta
-
-# training artifacts
-artifacts/
+# classification-head weights are published as a GitHub release, not in the repo
 *.pt
 
-# python cache
+# training runs, downloaded checkpoints, and prediction outputs
+artifacts/
+
+# local ProstT5 checkout
+models/
+
+# python
 __pycache__/
 *.pyc
 .pytest_cache/
+.venv/
+venv/
 
-# local large/generated files
-models/
-artifacts/
+# latex build files for CLIPer.tex
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.out
+*.synctex.gz
+*.toc
 
-# local export / sync bundles (large; do not commit)
+# local archives and editor files
 *.tar
 *.tar.gz
-
-# disorder: user-provided FASTA in package dir (keep __init__.py)
-disorder/data/*
-!disorder/data/__init__.py
+.idea/

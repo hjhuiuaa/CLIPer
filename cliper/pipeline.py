@@ -20,7 +20,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader, Dataset
 import yaml
 
-from .caid_io import read_residue_embedding
+from .embeddings import read_residue_embedding
 from .data import (
     MotifSpec,
     ProteinRecord,
@@ -37,15 +37,8 @@ from .data import (
     tokenize_sequence_with_motifs,
     write_json,
 )
-from .metrics import (
-    apply_threshold,
-    binary_roc_auc,
-    f1_score,
-    mcc_score,
-    precision_recall_auc,
-    search_best_threshold,
-)
-from .modeling import (
+from .metrics import extract_scored_residues, score_scenarios
+from .model import (
     DummyBackbone,
     DummyProteinTokenizer,
     DualTokenizerResidueClassifier,
@@ -1657,43 +1650,6 @@ def _batched_forward_from_embeddings(
     return outputs
 
 
-def _ternary_label_chars(linker_class: int) -> tuple[str, str, str]:
-    """Return (linker_char, other_idr_char, ordered_char)."""
-    if int(linker_class) == 2:
-        return "2", "1", "0"
-    return "1", "0", "2"
-
-
-def _extract_scored_residues(
-    labels: str,
-    probs: list[float],
-    *,
-    protocol: str = "t1",
-    linker_class: int = 1,
-) -> tuple[list[int], list[float]]:
-    """Map residue labels to binary linker scores.
-
-    protocol='t1': linker vs {other IDR, ordered}
-    protocol='t2': linker vs other IDR only (ordered ignored)
-    """
-    linker_ch, other_ch, ordered_ch = _ternary_label_chars(linker_class)
-    y_true: list[int] = []
-    y_prob: list[float] = []
-    for char, prob in zip(labels, probs):
-        if char == linker_ch:
-            y_true.append(1)
-            y_prob.append(prob)
-        elif char == other_ch:
-            y_true.append(0)
-            y_prob.append(prob)
-        elif protocol == "t1" and char == ordered_ch:
-            y_true.append(0)
-            y_prob.append(prob)
-        else:
-            continue
-    return y_true, y_prob
-
-
 def evaluate_records(
     model: nn.Module,
     tokenizer: Any,
@@ -1723,6 +1679,7 @@ def evaluate_records(
     y_prob_all: list[float] = []
     y_true_t2: list[int] = []
     y_prob_t2: list[float] = []
+    include_scenario2 = num_classes > 1 or dual_binary or int(linker_class) == 2
 
     for record in records:
         starts = build_eval_window_starts(
@@ -1766,60 +1723,32 @@ def evaluate_records(
             merged_logits, linker_class=linker_class, dual_binary=dual_binary
         )
         per_record.append((record.protein_id, record.labels, probs))
-        true_slice, prob_slice = _extract_scored_residues(
-            record.labels, probs, protocol="t1", linker_class=linker_class
+        true_slice, prob_slice = extract_scored_residues(
+            record.labels, probs, scenario="scenario1", linker_class=linker_class
         )
         y_true_all.extend(true_slice)
         y_prob_all.extend(prob_slice)
-        if num_classes > 1 or dual_binary or int(linker_class) == 2:
-            t2_true, t2_prob = _extract_scored_residues(
-                record.labels, probs, protocol="t2", linker_class=linker_class
+        if include_scenario2:
+            t2_true, t2_prob = extract_scored_residues(
+                record.labels, probs, scenario="scenario2", linker_class=linker_class
             )
             y_true_t2.extend(t2_true)
             y_prob_t2.extend(t2_prob)
 
-    tuned_threshold = threshold
-    best_f1 = 0.0
-    best_mcc = 0.0
-    if y_true_all and tuned_threshold is None:
-        tuned_threshold, best_f1, best_mcc = search_best_threshold(
-            y_true_all,
-            y_prob_all,
-            min_threshold=float(threshold_search["min"]),
-            max_threshold=float(threshold_search["max"]),
-            step=float(threshold_search["step"]),
-        )
-    if tuned_threshold is None:
-        tuned_threshold = 0.5
-
-    preds = apply_threshold(y_prob_all, tuned_threshold) if y_true_all else []
-    auprc = precision_recall_auc(y_true_all, y_prob_all) if y_true_all else 0.0
-    auroc = binary_roc_auc(y_true_all, y_prob_all)
-    f1 = best_f1 if y_true_all and threshold is None else (f1_score(y_true_all, preds) if y_true_all else 0.0)
-    mcc = best_mcc if y_true_all and threshold is None else (mcc_score(y_true_all, preds) if y_true_all else 0.0)
-
-    metrics: dict[str, Any] = {
-        "num_records": len(records),
-        "num_scored_residues": len(y_true_all),
-        "auprc": auprc,
-        "auroc": auroc,
-        "auprc_t1": auprc,
-        "auroc_t1": auroc,
-        "f1": f1,
-        "mcc": mcc,
-        "threshold": tuned_threshold,
-        "protocol_t1": "linker vs {other_idr, ordered}",
-        "linker_class": int(linker_class),
-    }
-    if num_classes > 1 or dual_binary or int(linker_class) == 2:
-        metrics["auprc_t2"] = precision_recall_auc(y_true_t2, y_prob_t2) if y_true_t2 else 0.0
-        metrics["auroc_t2"] = binary_roc_auc(y_true_t2, y_prob_t2)
-        metrics["num_scored_residues_t2"] = len(y_true_t2)
-        metrics["protocol_t2"] = "linker vs other_idr"
-
+    scored = score_scenarios(
+        num_records=len(records),
+        y_true=y_true_all,
+        y_prob=y_prob_all,
+        y_true_scenario2=y_true_t2,
+        y_prob_scenario2=y_prob_t2,
+        threshold=threshold,
+        threshold_search=threshold_search,
+        linker_class=linker_class,
+        include_scenario2=include_scenario2,
+    )
     return {
-        "threshold": tuned_threshold,
-        "metrics": metrics,
+        "threshold": scored["threshold"],
+        "metrics": scored["metrics"],
         "per_record": per_record,
     }
 

@@ -1,44 +1,22 @@
-# CLIPer Dataset
+# CLIPer dataset
 
-This folder contains the datasets used in the CLIPer project
-(*Contrastive Learning for Intrinsically disordered Protein linker classification*).
+Sequences used by the paper method. Labels are `0` ordered, `1` other disordered residue, and `2` linker.
 
-## Dataset Overview
+## Paper split
 
-- `disprot9.5/`: primary source data from DisProt, used for model development.
-- `caid3/`: CAID3-related data, used as an external benchmark test set.
+`t2_seqneg/` is the split used for training, validation, and the two evaluation scenarios:
 
-## Data Split Policy
+- `train.fasta`, `val.fasta`, `train_val.fasta`
+- `test_caid3.fasta` — scenario 1, 31 CAID3 linker proteins
+- `test_scene2_pdb62.fasta` — scenario 2, linker versus other disordered residues
+- `error.txt` — proteins excluded from training and validation
 
-To keep evaluation consistent with the CLIPer project design:
+Rebuild the training split and both test sets with `python scripts/prepare_dataset.py`.
 
-- **Training set**: from **DisProt**
-- **Validation set**: from **DisProt**
-- **Test set**: from **CAID3**
+## Source files for that rebuild
 
-This setup is intended to evaluate generalization on a competition-style test distribution while training and tuning on curated DisProt annotations.
-
-## File-level Notes
-
-### `disprot9.5/`
-
-- `disprot_202312_label.fasta`: DisProt sequence-level labels for **disorder** residues (binary string per sequence).
-- `disprot_202312_linker_label.fasta`: DisProt sequence-level labels for **linker** residues (binary string per sequence).
-- `error.txt`: cases where a disorder region is only partially covered by linker labels (records sequences/regions needing manual review).
-- `merged1.fasta`: merged annotation view used during preprocessing; each record typically contains sequence + multiple label lines aligned by residue index.
-- `prostt5_input.fasta`: sequence-only FASTA prepared as input for ProstT5 embedding extraction (no label lines).
-- `esm_input.fasta`, `esm_input_train.fasta`, `esm_input_valid.fasta`: sequence-only FASTA files prepared for ESM-style embedding/inference workflow.
-- `train.fasta`, `valid.fasta`: legacy split files from an earlier experiment setup (kept locally for traceability; not part of the active split policy).
-
-### `caid3/`
-
-- `linker.fasta`: CAID3 linker benchmark labels (used as test target in CLIPer).
-- `binding.fasta`: CAID3 binding-site labels.
-- `binding_idr.fasta`: CAID3 binding labels mapped to IDR-focused representation (contains alignment-style placeholders in some records).
-- `disorder_nox.fasta`: CAID3 disorder labels in a sequence set with ambiguous `X` residues removed/normalized.
-- `disorder_pdb.fasta`: CAID3 disorder labels in a PDB-mapped representation (contains alignment/padding placeholders for coordinate mapping).
-- `predictions.zip`: archived CAID prediction outputs from prior runs.
-
-## Notes
-
-- Additional preprocessing details and training scripts are documented in the repository root `README.md` and in the `CLAPE-SMB/` baseline folder.
+- `disprot_202312_linker_label.fasta` — DisProt linker labels
+- `disprot_202312_label.fasta` — DisProt disorder labels
+- `error.txt`
+- `linker.fasta` — CAID3 linker reference
+- `disorder_pdb.fasta` — CAID3 disorder-PDB reference

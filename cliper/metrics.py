@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
+from typing import Any, Iterable
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -74,7 +74,7 @@ def mcc_score(y_true: Iterable[int], y_pred: Iterable[int]) -> float:
 
 
 def binary_roc_auc(y_true: list[int], y_prob: list[float]) -> float | None:
-    """Rank-based AUROC (Mann–Whitney U), matching eval_auc.py. Returns None if undefined."""
+    """Rank-based AUROC (Mann–Whitney U). Returns None if undefined."""
     if not y_true:
         return None
     n_pos = sum(y_true)
@@ -129,4 +129,95 @@ def search_best_threshold(
         threshold += step
 
     return best_threshold, max(best_f1, 0.0), max(best_mcc, 0.0)
+
+
+def ternary_label_chars(linker_class: int) -> tuple[str, str, str]:
+    """Return (linker, other disordered residue, ordered)."""
+    if int(linker_class) == 2:
+        return "2", "1", "0"
+    return "1", "0", "2"
+
+
+def extract_scored_residues(
+    labels: str,
+    probs: list[float],
+    *,
+    scenario: str = "scenario1",
+    linker_class: int = 1,
+) -> tuple[list[int], list[float]]:
+    """Map residue labels to a binary linker score for one scenario.
+
+    scenario1 scores linker against every other residue.
+    scenario2 scores linker against other disordered residues and skips ordered residues.
+    """
+    if scenario not in {"scenario1", "scenario2", "t1", "t2"}:
+        raise ValueError(f"Unknown scenario: {scenario}")
+    linker_vs_disorder_only = scenario in {"scenario2", "t2"}
+    linker_ch, other_ch, ordered_ch = ternary_label_chars(linker_class)
+    y_true: list[int] = []
+    y_prob: list[float] = []
+    for char, prob in zip(labels, probs):
+        if char == linker_ch:
+            y_true.append(1)
+            y_prob.append(prob)
+        elif char == other_ch:
+            y_true.append(0)
+            y_prob.append(prob)
+        elif not linker_vs_disorder_only and char == ordered_ch:
+            y_true.append(0)
+            y_prob.append(prob)
+    return y_true, y_prob
+
+
+def score_scenarios(
+    *,
+    num_records: int,
+    y_true: list[int],
+    y_prob: list[float],
+    y_true_scenario2: list[int],
+    y_prob_scenario2: list[float],
+    threshold: float | None,
+    threshold_search: dict[str, float],
+    linker_class: int,
+    include_scenario2: bool,
+) -> dict[str, Any]:
+    """Score scenario 1, and scenario 2 when the labels distinguish other disorder."""
+    tuned_threshold = threshold
+    best_f1 = 0.0
+    best_mcc = 0.0
+    if y_true and tuned_threshold is None:
+        tuned_threshold, best_f1, best_mcc = search_best_threshold(
+            y_true,
+            y_prob,
+            min_threshold=float(threshold_search["min"]),
+            max_threshold=float(threshold_search["max"]),
+            step=float(threshold_search["step"]),
+        )
+    if tuned_threshold is None:
+        tuned_threshold = 0.5
+
+    preds = apply_threshold(y_prob, tuned_threshold) if y_true else []
+    auprc = precision_recall_auc(y_true, y_prob) if y_true else 0.0
+    auroc = binary_roc_auc(y_true, y_prob)
+    f1 = best_f1 if y_true and threshold is None else (f1_score(y_true, preds) if y_true else 0.0)
+    mcc = best_mcc if y_true and threshold is None else (mcc_score(y_true, preds) if y_true else 0.0)
+    metrics: dict[str, Any] = {
+        "num_records": num_records,
+        "num_scored_residues": len(y_true),
+        "auprc": auprc,
+        "auroc": auroc,
+        "auprc_t1": auprc,
+        "auroc_t1": auroc,
+        "f1": f1,
+        "mcc": mcc,
+        "threshold": tuned_threshold,
+        "protocol_t1": "linker vs {other_idr, ordered}",
+        "linker_class": int(linker_class),
+    }
+    if include_scenario2:
+        metrics["auprc_t2"] = precision_recall_auc(y_true_scenario2, y_prob_scenario2) if y_true_scenario2 else 0.0
+        metrics["auroc_t2"] = binary_roc_auc(y_true_scenario2, y_prob_scenario2)
+        metrics["num_scored_residues_t2"] = len(y_true_scenario2)
+        metrics["protocol_t2"] = "linker vs other_idr"
+    return {"threshold": tuned_threshold, "metrics": metrics}
 
