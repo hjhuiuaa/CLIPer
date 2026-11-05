@@ -8,9 +8,13 @@ Jiahua Hu and Xinning Lu (College of Computer Science, Nankai University) and Ku
 
 Disordered linkers (DLs) are intrinsically disordered regions that connect adjacent functional regions or domains. CLIPer predicts them from a frozen ProstT5 encoder. Each residue is represented by the concatenation of its own 1,024-dimensional embedding and the embeddings of its two neighbors (3,072 dimensions; missing neighbors are zeros). A convolutional layer (kernel size 3, 128 channels) and one bidirectional GRU (hidden size 64 in each direction) then produce a linker probability. Training minimizes binary cross-entropy on the linker label plus a three-class supervised contrastive loss. The classes are ordered residues, disordered non-linker residues, and linkers. The contrastive weight is \(\lambda = 0.2\), and the positive weight on linker residues is about 28. The optimizer is AdamW with learning rate \(2 \times 10^{-4}\). A new checkpoint is kept when Scene 1 AUC improves by at least 0.002. All experiments ran on two NVIDIA RTX A6000 GPUs (48 GB each).
 
+![CLIPer architecture. ProstT5 embeddings pass through a convolutional layer and a bidirectional GRU. One branch predicts the linker probability. The other separates linker, non-linker disorder, and ordered residues.](artifacts/figures/fig1_architecture.png)
+
 Sequences longer than 1,024 residues are embedded in non-overlapping windows of 1,024 and concatenated in residue order.
 
 ## Two evaluation scenes
+
+![Scene 1 scores every residue, with linkers positive. Scene 2 scores only disordered residues, with non-linker disorder as the negative class.](artifacts/figures/fig2_scenarios.png)
 
 Scene 1 follows the CAID linker comparison: a linker residue is positive and every other residue is negative. Scene 2 keeps only disordered residues: a linker residue is positive and a disordered non-linker residue is negative. Both scenes use the same residue probabilities. AUC, average precision (APS), and \(F_{1\max}\) are the reported metrics. They do not use a single fixed call threshold. In Scene 1, CLIPer reaches its \(F_{1\max}\) at a probability threshold of 0.874.
 
@@ -58,12 +62,12 @@ The released file is the trained classification head: the convolution, the bidir
 python run_paper_example.py --check-only
 ```
 
-The command downloads [best.pt](https://github.com/hjhuiuaa/CLIPer/releases/download/paper-supcon/best.pt) from the `paper-supcon` release and saves it to `artifacts/paper/best.pt`. The printed configuration should show one convolution with 128 channels, a bidirectional GRU with hidden size 64 and one layer, `linker_class` 2, and ternary contrastive weight 0.2.
+The command downloads [best.pt](https://github.com/hjhuiuaa/CLIPer/releases/download/Pretrained-Weights/best.pt) from the `Pretrained-Weights` release and saves it to `artifacts/paper/best.pt`. The printed configuration should show one convolution with 128 channels, a bidirectional GRU with hidden size 64 and one layer, `linker_class` 2, and ternary contrastive weight 0.2.
 
 The same file can be fetched directly:
 
 ```bash
-curl -L -o artifacts/paper/best.pt https://github.com/hjhuiuaa/CLIPer/releases/download/paper-supcon/best.pt
+curl -L -o artifacts/paper/best.pt https://github.com/hjhuiuaa/CLIPer/releases/download/Pretrained-Weights/best.pt
 ```
 
 ### ProstT5

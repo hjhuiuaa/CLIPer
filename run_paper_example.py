@@ -1,6 +1,6 @@
 """Check the released paper checkpoint and, optionally, predict one example protein.
 
-The classifier weights are the GitHub release ``paper-supcon``. ProstT5 is
+The classifier weights are the GitHub release ``Pretrained-Weights``. ProstT5 is
 downloaded from Hugging Face only when prediction is requested.
 """
 
@@ -11,7 +11,7 @@ import json
 import urllib.request
 from pathlib import Path
 
-RELEASE_URL = "https://github.com/hjhuiuaa/CLIPer/releases/download/paper-supcon/best.pt"
+RELEASE_URL = "https://github.com/hjhuiuaa/CLIPer/releases/download/Pretrained-Weights/best.pt"
 PAPER_THRESHOLD = 0.946
 
 

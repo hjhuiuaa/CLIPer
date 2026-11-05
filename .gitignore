@@ -2,7 +2,9 @@
 *.pt
 
 # training runs, downloaded checkpoints, and prediction outputs
-artifacts/
+artifacts/*
+!artifacts/figures/
+!artifacts/figures/*.png
 
 # local ProstT5 checkout
 models/
